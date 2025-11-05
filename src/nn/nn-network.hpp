@@ -2,8 +2,36 @@
 #define NN_NETWORK_H
 
 #include "nn-executor.hpp"
+#include <chrono>
+#include <vector>
+#include <string>
 
 #define ROOT_SOCKET_INDEX 0
+
+// Network performance monitoring structures
+struct NnNetworkMetrics {
+    std::chrono::high_resolution_clock::time_point startTime;
+    std::chrono::high_resolution_clock::time_point endTime;
+    NnSize bytesTransferred;
+    NnUint operationCount;
+    std::string operationType;
+    NnUint socketIndex;
+    
+    NnNetworkMetrics() : bytesTransferred(0), operationCount(0), socketIndex(0) {}
+};
+
+struct NnSocketPerformanceStats {
+    double avgLatencyMs;
+    double maxLatencyMs;
+    double minLatencyMs;
+    NnSize totalBytes;
+    NnUint totalOperations;
+    double bandwidthMbps;
+    std::vector<double> recentLatencies; // Last 100 operations
+    
+    NnSocketPerformanceStats() : avgLatencyMs(0), maxLatencyMs(0), minLatencyMs(0), 
+                                  totalBytes(0), totalOperations(0), bandwidthMbps(0) {}
+};
 
 void initSockets();
 void cleanupSockets();
@@ -39,6 +67,10 @@ private:
     int *sockets;
     NnSize *sentBytes;
     NnSize *recvBytes;
+    NnSocketPerformanceStats *socketStats;
+    std::vector<NnNetworkMetrics> recentMetrics;
+
+    void updateSocketStats(NnUint socketIndex, double latencyMs, NnSize bytes);
 
 public:
     static std::unique_ptr<NnNetwork> serve(int port);
@@ -60,6 +92,16 @@ public:
     void readMany(NnUint n, NnSocketIo *ios);
     void getStats(NnSize *sentBytes, NnSize *recvBytes);
     void resetStats();
+    
+    // Performance monitoring functions
+    void enablePerformanceMonitoring(bool enabled);
+    void printPerformanceReport();
+    void printBottleneckAnalysis();
+    NnSocketPerformanceStats* getSocketStats(NnUint socketIndex);
+    bool isPerformanceMonitoringEnabled() const;
+    void recordOperation(const std::string& operationType, NnUint socketIndex, NnSize bytes, 
+                        std::chrono::high_resolution_clock::time_point start, 
+                        std::chrono::high_resolution_clock::time_point end);
 };
 
 class NnNetworkNodeSynchronizer : public NnNodeSynchronizer {

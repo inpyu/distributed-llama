@@ -280,6 +280,10 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
             network->setTurbo(true);
             printf("🚁 Network is in non-blocking mode\n");
         }
+        
+        // Enable network performance monitoring for bottleneck analysis
+        network->enablePerformanceMonitoring(true);
+        printf("📊 Network performance monitoring enabled for bottleneck analysis\n");
     }
 
     AppInferenceContext context;
@@ -294,6 +298,12 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     handler(&context);
 
     inference.finish();
+    
+    // Print network performance report and bottleneck analysis
+    if (network != nullptr) {
+        network->printPerformanceReport();
+        network->printBottleneckAnalysis();
+    }
 }
 
 void runWorkerApp(AppCliArgs *args) {

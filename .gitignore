@@ -17,3 +17,7 @@ server
 /dllama-*
 *.exe
 *.spv
+
+# Model and tokenizer files
+dllama_model_*.m
+dllama_tokenizer_*.t

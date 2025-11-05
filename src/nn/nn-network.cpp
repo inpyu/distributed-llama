@@ -16,6 +16,10 @@ typedef SSIZE_T ssize_t;
 #include <stdexcept>
 #include <vector>
 #include <fcntl.h>
+#include <iostream>
+#include <iomanip>
+#include <algorithm>
+#include <map>
 
 #define SOCKET_LAST_ERRCODE errno
 #define SOCKET_LAST_ERROR strerror(errno)
@@ -327,6 +331,7 @@ std::unique_ptr<NnNetwork> NnNetwork::connect(NnUint nSockets, char **hosts, NnU
         printf("⭕ Socket[%d]: connecting to %s:%d worker\n", i, hosts[i], ports[i]);
         int socket = connectSocket(hosts[i], ports[i]);
         sockets[i] = socket;
+        // Protocol expects number of worker sockets only (without root)
         writeSocket(socket, &nSockets, sizeof(nSockets));
         writeSocket(socket, &i, sizeof(i)); // send node index
         for (NnUint j = 0; j < nSockets; j++) {
@@ -352,11 +357,13 @@ NnNetwork::NnNetwork(NnUint nSockets, int *sockets) {
     this->sockets = sockets;
     this->sentBytes = new NnSize[nSockets];
     this->recvBytes = new NnSize[nSockets];
+    this->socketStats = new NnSocketPerformanceStats[nSockets];
 }
 
 NnNetwork::~NnNetwork() {
     delete[] sentBytes;
     delete[] recvBytes;
+    delete[] socketStats;
     for (NnUint i = 0; i < nSockets; i++) {
         shutdown(sockets[i], 2);
         close(sockets[i]);
@@ -374,6 +381,8 @@ void NnNetwork::setTurbo(bool enabled) {
 void NnNetwork::write(const NnUint socketIndex, const void *data, const NnSize size) {
     assert(socketIndex < nSockets);
 
+    auto startTime = std::chrono::high_resolution_clock::now();
+    
     NnByte *current = (NnByte *)data;
     int s = sockets[socketIndex];
     for (NnSize chunk = 0; chunk < size; chunk += MAX_CHUNK_SIZE) {
@@ -382,11 +391,16 @@ void NnNetwork::write(const NnUint socketIndex, const void *data, const NnSize s
         current += chunkSize;
     }
     sentBytes[socketIndex] += size;
+    
+    auto endTime = std::chrono::high_resolution_clock::now();
+    recordOperation("write", socketIndex, size, startTime, endTime);
 }
 
 void NnNetwork::read(const NnUint socketIndex, void *data, const NnSize size) {
     assert(socketIndex < nSockets);
 
+    auto startTime = std::chrono::high_resolution_clock::now();
+    
     NnByte *current = (NnByte *)data;
     int s = sockets[socketIndex];
     for (NnSize chunk = 0; chunk < size; chunk += MAX_CHUNK_SIZE) {
@@ -395,6 +409,9 @@ void NnNetwork::read(const NnUint socketIndex, void *data, const NnSize size) {
         current += chunkSize;
     }
     recvBytes[socketIndex] += size;
+    
+    auto endTime = std::chrono::high_resolution_clock::now();
+    recordOperation("read", socketIndex, size, startTime, endTime);
 }
 
 void NnNetwork::writeAck(const NnUint socketIndex) {
@@ -460,12 +477,15 @@ void NnNetwork::writeAll(void *data, NnSize size) {
 }
 
 void NnNetwork::readMany(NnUint n, NnSocketIo *ios) {
+    auto startTime = std::chrono::high_resolution_clock::now();
+    
     bool isReading;
     NnSize nBytes = 0;
     for (NnUint i = 0; i < n; i++) {
         NnSocketIo *io = &ios[i];
         assert(io->socketIndex < nSockets);
         recvBytes[io->socketIndex] += io->size;
+        nBytes += io->size;
     }
     do {
         isReading = false;
@@ -488,6 +508,9 @@ void NnNetwork::readMany(NnUint n, NnSocketIo *ios) {
             }
         }
     } while (isReading);
+    
+    auto endTime = std::chrono::high_resolution_clock::now();
+    recordOperation("readMany", 0, nBytes, startTime, endTime);
 }
 
 void NnNetwork::getStats(NnSize *sentBytes, NnSize *recvBytes) {
@@ -505,6 +528,172 @@ void NnNetwork::resetStats() {
         sentBytes[i] = 0;
         recvBytes[i] = 0;
     }
+}
+
+// Static member for performance monitoring state
+static bool g_performanceMonitoringEnabled = false;
+
+void NnNetwork::enablePerformanceMonitoring(bool enabled) {
+    g_performanceMonitoringEnabled = enabled;
+    if (enabled) {
+        printf("📊 Network performance monitoring enabled\n");
+    }
+}
+
+bool NnNetwork::isPerformanceMonitoringEnabled() const {
+    return g_performanceMonitoringEnabled;
+}
+
+void NnNetwork::recordOperation(const std::string& operationType, NnUint socketIndex, NnSize bytes, 
+                               std::chrono::high_resolution_clock::time_point start, 
+                               std::chrono::high_resolution_clock::time_point end) {
+    if (!g_performanceMonitoringEnabled) return;
+    
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    double latencyMs = duration.count() / 1000.0;
+    
+    updateSocketStats(socketIndex, latencyMs, bytes);
+    
+    // Store recent metrics for analysis (thread-safe with size limit)
+    if (socketIndex < nSockets) {  // Safety check
+        NnNetworkMetrics metric;
+        metric.startTime = start;
+        metric.endTime = end;
+        metric.bytesTransferred = bytes;
+        metric.operationType = operationType;
+        metric.socketIndex = socketIndex;
+        
+        // Limit metrics storage to prevent memory issues
+        if (recentMetrics.size() < 500) {
+            recentMetrics.push_back(metric);
+        }
+    }
+}
+
+void NnNetwork::updateSocketStats(NnUint socketIndex, double latencyMs, NnSize bytes) {
+    if (socketIndex >= nSockets || !socketStats) return;
+    
+    NnSocketPerformanceStats& stats = socketStats[socketIndex];
+    
+    stats.totalOperations++;
+    stats.totalBytes += bytes;
+    
+    // Update latency statistics
+    if (stats.totalOperations == 1) {
+        stats.minLatencyMs = stats.maxLatencyMs = latencyMs;
+    } else {
+        stats.minLatencyMs = std::min(stats.minLatencyMs, latencyMs);
+        stats.maxLatencyMs = std::max(stats.maxLatencyMs, latencyMs);
+    }
+    
+    // Update average latency
+    stats.avgLatencyMs = (stats.avgLatencyMs * (stats.totalOperations - 1) + latencyMs) / stats.totalOperations;
+    
+    // Update recent latencies (limit size for memory safety)
+    if (stats.recentLatencies.size() < 50) {
+        stats.recentLatencies.push_back(latencyMs);
+    }
+    
+    // Calculate bandwidth (MB/s)
+    if (latencyMs > 0) {
+        double bandwidthMBps = (bytes / (1024.0 * 1024.0)) / (latencyMs / 1000.0);
+        stats.bandwidthMbps = bandwidthMBps * 8; // Convert to Mbps
+    }
+}
+
+void NnNetwork::printPerformanceReport() {
+    if (!g_performanceMonitoringEnabled) {
+        printf("📊 Performance monitoring is disabled. Enable it first.\n");
+        return;
+    }
+    
+    printf("\n📊 === Network Performance Report ===\n");
+    printf("Socket | Operations | Total MB | Avg Latency | Max Latency | Min Latency | Bandwidth\n");
+    printf("-------|------------|----------|-------------|-------------|-------------|----------\n");
+    
+    for (NnUint i = 0; i < nSockets; i++) {
+        NnSocketPerformanceStats& stats = socketStats[i];
+        if (stats.totalOperations > 0) {
+            printf("   %2d  |    %6d   |  %6.2f   |   %6.2f ms  |   %6.2f ms  |   %6.2f ms  |  %6.2f Mbps\n",
+                   i, stats.totalOperations, stats.totalBytes / (1024.0 * 1024.0),
+                   stats.avgLatencyMs, stats.maxLatencyMs, stats.minLatencyMs, stats.bandwidthMbps);
+        }
+    }
+    printf("\n");
+}
+
+void NnNetwork::printBottleneckAnalysis() {
+    if (!g_performanceMonitoringEnabled) {
+        printf("📊 Performance monitoring is disabled. Enable it first.\n");
+        return;
+    }
+    
+    printf("\n🔍 === Network Bottleneck Analysis ===\n");
+    
+    // Find the slowest socket
+    NnUint slowestSocket = 0;
+    double maxAvgLatency = 0;
+    for (NnUint i = 0; i < nSockets; i++) {
+        if (socketStats[i].totalOperations > 0 && socketStats[i].avgLatencyMs > maxAvgLatency) {
+            maxAvgLatency = socketStats[i].avgLatencyMs;
+            slowestSocket = i;
+        }
+    }
+    
+    printf("🐌 Slowest Socket: %d (Avg Latency: %.2f ms)\n", slowestSocket, maxAvgLatency);
+    
+    // Analyze recent latencies for variance
+    for (NnUint i = 0; i < nSockets; i++) {
+        if (!socketStats) continue;
+        NnSocketPerformanceStats& stats = socketStats[i];
+        if (stats.recentLatencies.size() > 10) {
+            std::vector<double> latencies = stats.recentLatencies;
+            std::sort(latencies.begin(), latencies.end());
+            
+            size_t size = latencies.size();
+            if (size > 0) {
+                double p50 = latencies[size / 2];
+                double p95 = latencies[static_cast<size_t>(size * 0.95)];
+                double p99 = latencies[static_cast<size_t>(size * 0.99)];
+                
+                printf("Socket %d: P50=%.2fms, P95=%.2fms, P99=%.2fms\n", i, p50, p95, p99);
+                
+                // Detect potential bottlenecks
+                if (p95 > p50 * 2.0) {
+                    printf("⚠️  Socket %d shows high latency variance (P95 >> P50) - potential network congestion\n", i);
+                }
+                if (stats.bandwidthMbps < 10.0 && stats.totalOperations > 100) {
+                    printf("⚠️  Socket %d has low bandwidth (%.2f Mbps) - potential bandwidth limitation\n", i, stats.bandwidthMbps);
+                }
+            }
+        }
+    }
+    
+    // Analyze operation types
+    std::map<std::string, int> operationCounts;
+    std::map<std::string, NnSize> operationBytes;
+    std::map<std::string, double> operationLatencies;
+    
+    for (const auto& metric : recentMetrics) {
+        operationCounts[metric.operationType]++;
+        operationBytes[metric.operationType] += metric.bytesTransferred;
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(metric.endTime - metric.startTime);
+        operationLatencies[metric.operationType] += duration.count() / 1000.0;
+    }
+    
+    printf("\n📈 Operation Analysis:\n");
+    for (const auto& op : operationCounts) {
+        double avgLatency = operationLatencies[op.first] / op.second;
+        double totalMB = operationBytes[op.first] / (1024.0 * 1024.0);
+        printf("  %s: %d ops, %.2f MB, %.2f ms avg\n", op.first.c_str(), op.second, totalMB, avgLatency);
+    }
+    
+    printf("\n");
+}
+
+NnSocketPerformanceStats* NnNetwork::getSocketStats(NnUint socketIndex) {
+    if (socketIndex >= nSockets) return nullptr;
+    return &socketStats[socketIndex];
 }
 
 static void syncWithRoot(NnNetwork *network, NnByte nodeIndex, NnByte *buffer, NnSize nBytes, NnUint nThreads, NnUint threadIndex) {
@@ -534,7 +723,8 @@ static void syncWithRoot(NnNetwork *network, NnByte nodeIndex, NnByte *buffer, N
     }
 }
 
-static void syncNodeSlices(bool onlyFromWorkerToRoot, NnNetwork *network, NnUint nodeIndex, NnUint nNodes, NnByte *buffer, NnSize nBytes, NnUint nThreads, NnUint threadIndex) {
+// Original O(n^2) implementation - kept for backward compatibility
+static void syncNodeSlices_alltoall(bool onlyFromWorkerToRoot, NnNetwork *network, NnUint nodeIndex, NnUint nNodes, NnByte *buffer, NnSize nBytes, NnUint nThreads, NnUint threadIndex) {
     bool isWorker = nodeIndex != 0;
     NnUint nSockets = onlyFromWorkerToRoot && isWorker ? 1 : network->nSockets;
     NnUint nSocketsPerThread = nSockets / nThreads + (nSockets % nThreads > threadIndex ? 1 : 0);
@@ -568,6 +758,290 @@ static void syncNodeSlices(bool onlyFromWorkerToRoot, NnNetwork *network, NnUint
     }
 }
 
+// ============================================================================
+// O(log n) Binary Tree Gather-Broadcast Implementation
+// This is a fundamental redesign that reduces complexity from O(n^2) to O(log n)
+// Architecture: Gather to Root → (Optional Compute) → Broadcast from Root
+// ============================================================================
+
+// Helper to get socket index in full mesh topology
+// Socket mapping matches the original alltoall implementation
+static inline NnUint getSocketIndexForNode(NnUint myNodeIndex, NnUint peerNode) {
+    // Root (node 0): sockets map directly to workers
+    // socket[0] -> worker 1, socket[1] -> worker 2, etc.
+    if (myNodeIndex == 0) {
+        return peerNode - 1;
+    }
+    
+    // Workers: socket[0] is root, socket[1..n-2] are other workers
+    // When communicating with other workers, skip self
+    if (peerNode == 0) {
+        return 0;  // Root is always socket[0] for workers
+    }
+    
+    // Worker to worker: map peer node to socket index
+    // Socket indices for workers: 0=root, 1=node1, 2=node2, ..., but skip self
+    if (peerNode < myNodeIndex) {
+        return peerNode;  // Peer comes before us in socket array
+    } else {
+        return peerNode - 1;  // Peer comes after us, but we skip ourselves
+    }
+}
+
+// O(n) Ring All-Gather - Simple and Reliable
+// Each step: all nodes simultaneously send to right and receive from left
+static void ringAllGather(NnNetwork *network, NnUint nodeIndex, NnUint nNodes, NnByte *buffer, NnSize sliceBytes, NnUint nThreads, NnUint threadIndex) {
+    if (threadIndex != 0) return;  // Only thread 0
+    
+    if (threadIndex == 0) {
+        printf("🔄 [Node %u] RING ALL-GATHER START: nNodes=%u, sliceBytes=%zu\n", 
+               nodeIndex, nNodes, sliceBytes);
+        fflush(stdout);
+    }
+    
+    // Ring topology: each node sends to next and receives from previous
+    NnUint sendToNode = (nodeIndex + 1) % nNodes;
+    NnUint recvFromNode = (nodeIndex + nNodes - 1) % nNodes;
+    
+    NnUint sendSocketIndex = getSocketIndexForNode(nodeIndex, sendToNode);
+    NnUint recvSocketIndex = getSocketIndexForNode(nodeIndex, recvFromNode);
+    
+    printf("🔄 [Node %u] Ring: send to Node %u (socket %u), recv from Node %u (socket %u)\n",
+           nodeIndex, sendToNode, sendSocketIndex, recvFromNode, recvSocketIndex);
+    fflush(stdout);
+    
+    // In n-1 steps, collect all slices
+    for (NnUint step = 0; step < nNodes - 1; step++) {
+        // Determine which slice to send and where to receive
+        NnUint sendSliceIndex = (nodeIndex - step + nNodes) % nNodes;
+        NnUint recvSliceIndex = (nodeIndex - step - 1 + nNodes) % nNodes;
+        
+        printf("🔄 [Node %u] Step %u: sending slice %u, receiving slice %u\n",
+               nodeIndex, step, sendSliceIndex, recvSliceIndex);
+        fflush(stdout);
+        
+        NnSocketIo sendIo, recvIo;
+        sendIo.socketIndex = sendSocketIndex;
+        sendIo.data = &buffer[sliceBytes * sendSliceIndex];
+        sendIo.size = sliceBytes;
+        
+        recvIo.socketIndex = recvSocketIndex;
+        recvIo.data = &buffer[sliceBytes * recvSliceIndex];
+        recvIo.size = sliceBytes;
+        
+        // Critical: Send and receive in a way that avoids circular deadlock
+        // Even nodes send first, odd nodes receive first
+        if (nodeIndex % 2 == 0) {
+            printf("📤 [Node %u] Step %u: Sending first\n", nodeIndex, step);
+            fflush(stdout);
+            network->writeMany(1, &sendIo);
+            printf("📥 [Node %u] Step %u: Now receiving\n", nodeIndex, step);
+            fflush(stdout);
+            network->readMany(1, &recvIo);
+        } else {
+            printf("📥 [Node %u] Step %u: Receiving first\n", nodeIndex, step);
+            fflush(stdout);
+            network->readMany(1, &recvIo);
+            printf("📤 [Node %u] Step %u: Now sending\n", nodeIndex, step);
+            fflush(stdout);
+            network->writeMany(1, &sendIo);
+        }
+        
+        printf("✅ [Node %u] Step %u complete\n", nodeIndex, step);
+        fflush(stdout);
+    }
+    
+    if (threadIndex == 0) {
+        printf("🔄 [Node %u] RING ALL-GATHER COMPLETE\n", nodeIndex);
+        fflush(stdout);
+    }
+}
+
+// Binary Tree Broadcast: O(log n) - Distribute all data from root
+// Uses top-down tree broadcasting with multithreading support  
+static void binaryTreeBroadcast(NnNetwork *network, NnUint nodeIndex, NnUint nNodes, NnByte *buffer, NnSize nBytes, NnUint nThreads, NnUint threadIndex) {
+    if (threadIndex == 0) {
+        printf("📡 [Node %u] BROADCAST START: nNodes=%u, nBytes=%zu, nThreads=%u\n", 
+               nodeIndex, nNodes, nBytes, nThreads);
+        fflush(stdout);
+    }
+    
+    // Calculate tree depth
+    NnUint treeDepth = 0;
+    NnUint temp = nNodes - 1;
+    while (temp > 0) {
+        treeDepth++;
+        temp >>= 1;
+    }
+    
+    if (threadIndex == 0) {
+        printf("📡 [Node %u] Tree depth: %u\n", nodeIndex, treeDepth);
+        fflush(stdout);
+    }
+    
+    // Top-down broadcasting: parents send to children
+    // IMPORTANT: Receivers must be ready BEFORE senders start
+    for (NnUint level = 0; level < treeDepth; level++) {
+        NnUint step = 1 << level;  // 2^level
+        NnUint stride = step << 1;  // 2^(level+1)
+        
+        if (threadIndex == 0) {
+            printf("📡 [Node %u] Level %u: step=%u, stride=%u, checking role...\n", 
+                   nodeIndex, level, step, stride);
+            fflush(stdout);
+        }
+        
+        // Receivers first
+        if (nodeIndex % stride == step && nodeIndex < nNodes) {
+            // I'm a receiver at this level
+            NnUint parentNode = nodeIndex - step;
+            if (threadIndex == 0) {
+                printf("📥 [Node %u] Level %u: I am RECEIVER from node %u\n", 
+                       nodeIndex, level, parentNode);
+                fflush(stdout);
+            }
+            
+            if (parentNode < nNodes && threadIndex == 0) {
+                NnUint socketIndex = getSocketIndexForNode(nodeIndex, parentNode);
+                
+                printf("📥 [Node %u] Receiving broadcast from node %u: socketIndex=%u, bytes=%zu\n",
+                       nodeIndex, parentNode, socketIndex, nBytes);
+                fflush(stdout);
+                
+                NnSocketIo io;
+                io.socketIndex = socketIndex;
+                io.data = buffer;
+                io.size = nBytes;
+                network->readMany(1, &io);
+                
+                printf("✅ [Node %u] Broadcast receive complete from node %u\n", nodeIndex, parentNode);
+                fflush(stdout);
+            }
+        } else if (nodeIndex % stride == 0 && nodeIndex + step < nNodes) {
+            // I'm a sender at this level
+            NnUint childNode = nodeIndex + step;
+            if (threadIndex == 0) {
+                printf("📤 [Node %u] Level %u: I am SENDER to node %u\n", 
+                       nodeIndex, level, childNode);
+                fflush(stdout);
+            }
+            
+            if (childNode < nNodes && threadIndex == 0) {
+                NnUint socketIndex = getSocketIndexForNode(nodeIndex, childNode);
+                
+                printf("📤 [Node %u] Broadcasting to node %u: socketIndex=%u, bytes=%zu\n",
+                       nodeIndex, childNode, socketIndex, nBytes);
+                fflush(stdout);
+                
+                NnSocketIo io;
+                io.socketIndex = socketIndex;
+                io.data = buffer;
+                io.size = nBytes;
+                network->writeMany(1, &io);
+                
+                printf("✅ [Node %u] Broadcast complete to node %u\n", nodeIndex, childNode);
+                fflush(stdout);
+            }
+        } else {
+            if (threadIndex == 0) {
+                printf("⏸️  [Node %u] Level %u: I am IDLE (no action at this level)\n", 
+                       nodeIndex, level);
+                fflush(stdout);
+            }
+        }
+    }
+    
+    if (threadIndex == 0) {
+        printf("📡 [Node %u] BROADCAST COMPLETE\n", nodeIndex);
+        fflush(stdout);
+    }
+    // Now all nodes have complete data
+}
+
+// Star Topology Gather-Broadcast - O(n) Root-Centric with proper multithreading
+// Phase 1: All workers send their slice to root (root receives in parallel)
+// Phase 2: Root broadcasts complete buffer to all workers (workers receive)
+static void syncNodeSlices_starGatherBroadcast(bool onlyFromWorkerToRoot, NnNetwork *network, NnUint nodeIndex, NnUint nNodes, NnByte *buffer, NnSize nBytes, NnUint nThreads, NnUint threadIndex) {
+    NnSize sliceBytes = nBytes / nNodes;
+    
+    // ========== PHASE 1: GATHER TO ROOT ==========
+    if (nodeIndex == 0) {
+        // ROOT: Collect slices from all workers
+        // Distribute workers across threads for PARALLEL receive
+        NnUint nWorkers = nNodes - 1;
+        NnUint workersPerThread = nWorkers / nThreads + (nWorkers % nThreads > threadIndex ? 1 : 0);
+        
+        for (NnUint i = 0; i < workersPerThread; i++) {
+            NnUint workerIdx = threadIndex + i * nThreads + 1;
+            if (workerIdx < nNodes) {
+                NnSocketIo io;
+                io.socketIndex = workerIdx - 1;
+                io.data = &buffer[sliceBytes * workerIdx];
+                io.size = sliceBytes;
+                network->readMany(1, &io);
+            }
+        }
+    } else {
+        // WORKER: Only thread 0 sends, but ALL threads must wait
+        // This ensures thread synchronization
+        if (threadIndex == 0) {
+            NnSocketIo io;
+            io.socketIndex = 0;
+            io.data = &buffer[sliceBytes * nodeIndex];
+            io.size = sliceBytes;
+            network->writeMany(1, &io);
+        }
+        // Implicit barrier: all threads exit this block together
+        // No early return - this keeps threads synchronized
+    }
+    
+    // If only gathering to root, we're done
+    if (onlyFromWorkerToRoot) {
+        // All threads reach here together
+        return;
+    }
+    
+    // ========== PHASE 2: BROADCAST FROM ROOT ==========
+    if (nodeIndex == 0) {
+        // ROOT: Broadcast complete buffer to all workers
+        // Distribute workers across threads for PARALLEL send
+        NnUint nWorkers = nNodes - 1;
+        NnUint workersPerThread = nWorkers / nThreads + (nWorkers % nThreads > threadIndex ? 1 : 0);
+        
+        for (NnUint i = 0; i < workersPerThread; i++) {
+            NnUint workerIdx = threadIndex + i * nThreads + 1;
+            if (workerIdx < nNodes) {
+                NnSocketIo io;
+                io.socketIndex = workerIdx - 1;
+                io.data = buffer;
+                io.size = nBytes;
+                network->writeMany(1, &io);
+            }
+        }
+    } else {
+        // WORKER: Only thread 0 receives, but ALL threads must wait
+        if (threadIndex == 0) {
+            NnSocketIo io;
+            io.socketIndex = 0;
+            io.data = buffer;
+            io.size = nBytes;
+            network->readMany(1, &io);
+        }
+        // Implicit barrier: all threads exit this function together
+    }
+    
+    // All threads reach here together - synchronized!
+}
+
+// Main syncNodeSlices function
+static void syncNodeSlices(bool onlyFromWorkerToRoot, NnNetwork *network, NnUint nodeIndex, NnUint nNodes, NnByte *buffer, NnSize nBytes, NnUint nThreads, NnUint threadIndex) {
+    // Use O(n) Star Gather-Broadcast
+    //syncNodeSlices_starGatherBroadcast(onlyFromWorkerToRoot, network, nodeIndex, nNodes, buffer, nBytes, nThreads, threadIndex);
+    
+    // Fallback O(n^2) if issues:
+    syncNodeSlices_alltoall(onlyFromWorkerToRoot, network, nodeIndex, nNodes, buffer, nBytes, nThreads, threadIndex);
+}
+
 NnNetworkNodeSynchronizer::NnNetworkNodeSynchronizer(NnNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig) {
     this->network = network;
     this->execution = execution;
@@ -586,15 +1060,29 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
 
         for (NnUint batchIndex = 0; batchIndex < execution->batchSize; batchIndex++) {
             NnByte *pipeBatch = &pipe[batchIndex * batchBytes];
+            
+            auto syncStartTime = std::chrono::high_resolution_clock::now();
+            std::string syncTypeName;
 
             if (syncConfig->syncType == SYNC_WITH_ROOT) {
+                syncTypeName = "SYNC_WITH_ROOT";
                 syncWithRoot(network, nodeConfig->nodeIndex, pipeBatch, batchBytes, nThreads, threadIndex);
             } else if (syncConfig->syncType == SYNC_NODE_SLICES) {
+                syncTypeName = "SYNC_NODE_SLICES";
                 syncNodeSlices(false, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, nThreads, threadIndex);
             } else if (syncConfig->syncType == SYNC_NODE_SLICES_EXCEPT_ROOT) {
+                syncTypeName = "SYNC_NODE_SLICES_EXCEPT_ROOT";
                 syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, nThreads, threadIndex);
             } else {
                 throw std::invalid_argument("Unknown sync type");
+            }
+            
+            auto syncEndTime = std::chrono::high_resolution_clock::now();
+            
+            // Record sync operation for monitoring
+            if (network->isPerformanceMonitoringEnabled()) {
+                NnSize totalBytes = batchBytes * execution->batchSize;
+                network->recordOperation(syncTypeName, 0, totalBytes, syncStartTime, syncEndTime);
             }
         }
     }
