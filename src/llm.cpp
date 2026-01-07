@@ -173,7 +173,7 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
     n.w1Slice = sliceRowMatmul(h->weightType, nNodes, h->dim, ffDim);
     n.w2Slice = sliceColMatmul(h->weightType, nNodes, ffDim, h->dim);
     n.w3Slice = sliceRowMatmul(h->weightType, nNodes, h->dim, ffDim);
-    n.wclsSlice = sliceRowMatmul(h->weightType, nNodes, h->dim, h->vocabSize);
+    n.wclsSlice = sliceColMatmul(h->weightType, nNodes, h->dim, h->vocabSize);
  
     NnUint nQNormColumns = 1;
     NnUint nKNormColumns = 1;
@@ -192,7 +192,7 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
     n.tokenPipeIndex = netBuilder.addPipe("TOK", size2D(F_32, nBatches, 1));
     n.xPipeIndex = netBuilder.addPipe("X", size2D(F_32, nBatches, h->dim));
     n.logitsPipeIndex = netBuilder.addPipe("LG", size2D(F_32, nBatches, h->vocabSize));
-    const NnUint zqPipeIndex = netBuilder.addPipe("ZQ", size2D(h->syncType, nBatches, h->dim * nNodes));
+    const NnUint zqPipeIndex = netBuilder.addPipe("ZQ", size2D(F_32, nBatches, h->dim));
 
     netBuilder.addPreSync(n.positionPipeIndex);
 
@@ -221,7 +221,7 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
 
         const NnUint ropeCacheBufferIndex = nodeBuilder.addBuffer("rope_cache", ropeSlice.cacheSize);
         const NnUint attBufferIndex = nodeBuilder.addBuffer("att", multiHeadAttSlice.attSize);
-        const NnUint logitsSliceBufferIndex = nodeBuilder.addBuffer("lg", size2D(F_32, nBatches, h->vocabSize / nNodes));
+        const NnUint logitsSliceBufferIndex = nodeBuilder.addBuffer("lg", size2D(F_32, nBatches, h->vocabSize));
 
         // not moe
         const NnUint dBufferIndex = nodeBuilder.addBuffer("d", size2D(F_32, nBatches, n.w1Slice.d0));
@@ -397,7 +397,7 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
             att.addOp(
                 OP_CAST, "block_cast_d", layerIndex,
                 pointerBatchConfig(SRC_BUFFER, yBufferIndex),
-                pointerBatchedSliceConfig(SRC_PIPE, zqPipeIndex),
+                pointerBatchConfig(SRC_PIPE, zqPipeIndex),
                 size0(),
                 NnCastOpCodeConfig{});
             att.addSync(zqPipeIndex, SYNC_NODE_SLICES);
@@ -548,7 +548,7 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
             ff.addOp(
                 OP_CAST, "block_cast_d3", layerIndex,
                 pointerBatchConfig(SRC_BUFFER, yBufferIndex),
-                pointerBatchedSliceConfig(SRC_PIPE, zqPipeIndex),
+                pointerBatchConfig(SRC_PIPE, zqPipeIndex),
                 size0(),
                 NnCastOpCodeConfig{});
             ff.addSync(zqPipeIndex, SYNC_NODE_SLICES);
@@ -586,17 +586,17 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
         }
         end.addOp(
             OP_MATMUL, "final_matmul_logits", 0,
-            pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
+            pointerBatchedSliceConfig(SRC_BUFFER, yqBufferIndex),
             pointerBatchConfig(SRC_BUFFER, logitsSliceBufferIndex),
-            size2D(h->weightType, n.wclsSlice.n, n.wclsSlice.d0),
+            size2D(h->weightType, n.wclsSlice.n0, n.wclsSlice.d),
             NnMatmulOpConfig{});
         end.addOp(
             OP_CAST, "final_cast_logits", 0,
             pointerBatchConfig(SRC_BUFFER, logitsSliceBufferIndex),
-            pointerBatchedSliceConfig(SRC_PIPE, n.logitsPipeIndex),
+            pointerBatchConfig(SRC_PIPE, n.logitsPipeIndex),
             size0(),
             NnCastOpCodeConfig{});
-        end.addSync(n.logitsPipeIndex, SYNC_NODE_SLICES_EXCEPT_ROOT);
+        end.addSync(n.logitsPipeIndex, SYNC_NODE_SLICES);
 
         nodeBuilder.addSegment(end.build());
         n.nodeConfigs[nodeIndex] = nodeBuilder.build();
@@ -658,7 +658,7 @@ void loadLlmNetWeight(const char *path, LlmNet *net, NnRootWeightLoader *loader)
     }
 
     b += loader->loadAll("final_norm", 0u, net->rmsNormSize.nBytes, b);
-    b += loader->loadRowMatmulSlices("final_matmul_logits", 0u, 0u, &net->wclsSlice, b);
+    b += loader->loadColMatmulSlices("final_matmul_logits", 0u, 0u, &net->wclsSlice, b);
 
     long long missingBytes = (long long)(b - data) - net->header->fileSize;
     if (missingBytes != 0u)

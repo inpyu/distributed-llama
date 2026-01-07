@@ -5,6 +5,7 @@
 #include <chrono>
 #include <vector>
 #include <string>
+#include <mutex>
 
 #define ROOT_SOCKET_INDEX 0
 
@@ -76,6 +77,7 @@ private:
     NnSize *recvBytes;
     NnSocketPerformanceStats *socketStats;
     std::vector<NnNetworkMetrics> recentMetrics;
+    std::mutex metricsMutex;
 
     void updateSocketStats(NnUint socketIndex, double latencyMs, NnSize bytes);
 

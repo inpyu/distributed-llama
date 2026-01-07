@@ -576,6 +576,8 @@ void NnNetwork::recordOperation(const std::string& operationType, NnUint socketI
                                std::chrono::high_resolution_clock::time_point end) {
     if (!g_performanceMonitoringEnabled) return;
     
+    std::lock_guard<std::mutex> lock(metricsMutex);
+
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
     double latencyMs = duration.count() / 1000.0;
     
@@ -633,6 +635,8 @@ void NnNetwork::printPerformanceReport() {
         printf("📊 Performance monitoring is disabled. Enable it first.\n");
         return;
     }
+
+    std::lock_guard<std::mutex> lock(metricsMutex);
     
     printf("\n📊 === Network Performance Report ===\n");
     printf("Socket | Operations | Total MB | Avg Latency | Max Latency | Min Latency | Bandwidth\n");
@@ -654,6 +658,8 @@ void NnNetwork::printBottleneckAnalysis() {
         printf("📊 Performance monitoring is disabled. Enable it first.\n");
         return;
     }
+
+    std::lock_guard<std::mutex> lock(metricsMutex);
     
     printf("\n🔍 === Network Bottleneck Analysis ===\n");
     
@@ -985,6 +991,246 @@ static void binaryTreeBroadcast(NnNetwork *network, NnUint nodeIndex, NnUint nNo
     // Now all nodes have complete data
 }
 
+// Helper function to check if pointer is properly aligned
+static inline bool isAligned(const void* ptr, size_t alignment) {
+    return (reinterpret_cast<uintptr_t>(ptr) % alignment) == 0;
+}
+
+// Helper function to perform element-wise reduction (sum) for All-Reduce
+// Supports F32, F16, Q80, Q40 data types
+// Uses ONLY byte-wise or memcpy-based operations for maximum safety (no direct pointer casting)
+static void reduceSum(NnByte *result, const NnByte *input, NnSize nBytes, NnFloatType floatType) {
+    // Safety check: ensure we have valid pointers and non-zero size
+    if (!result || !input || nBytes == 0) {
+        return;
+    }
+    
+    // For maximum safety and compatibility, always use memcpy approach
+    // This avoids any potential alignment issues regardless of input buffer alignment
+    if (floatType == F_32 || floatType == F_Q80 || floatType == F_Q40) {
+        // F32, Q80, Q40: Treat as float arrays
+        // Always use memcpy to aligned stack buffers - safest approach
+        NnSize nElements = nBytes / sizeof(float);
+        if (nElements > 0) {
+            const NnSize chunkSize = 256;  // Process 256 floats at a time (1KB chunks)
+            float inputBuf[chunkSize];
+            float resultBuf[chunkSize];
+            
+            NnSize processed = 0;
+            while (processed < nElements) {
+                NnSize currentChunk = (nElements - processed < chunkSize) ? 
+                                     (nElements - processed) : chunkSize;
+                
+                // Copy to stack buffers (always aligned on stack)
+                std::memcpy(inputBuf, input + processed * sizeof(float), currentChunk * sizeof(float));
+                std::memcpy(resultBuf, result + processed * sizeof(float), currentChunk * sizeof(float));
+                
+                // Perform reduction on aligned buffers
+                for (NnSize i = 0; i < currentChunk; i++) {
+                    resultBuf[i] += inputBuf[i];
+                }
+                
+                // Copy back
+                std::memcpy(result + processed * sizeof(float), resultBuf, currentChunk * sizeof(float));
+                processed += currentChunk;
+            }
+        }
+        
+        // Handle any remaining bytes (not multiple of float size)
+        NnSize remainingBytes = nBytes % sizeof(float);
+        if (remainingBytes > 0) {
+            NnSize offset = nElements * sizeof(float);
+            for (NnSize i = 0; i < remainingBytes; i++) {
+                result[offset + i] = static_cast<NnByte>(result[offset + i] + input[offset + i]);
+            }
+        }
+    } else if (floatType == F_16) {
+        // F16: Use memcpy for each element (always safe regardless of alignment)
+        NnSize nElements = nBytes / sizeof(NnFp16);
+        for (NnSize i = 0; i < nElements; i++) {
+            NnFp16 inputVal, resultVal;
+            // Use memcpy to avoid alignment issues
+            std::memcpy(&inputVal, input + i * sizeof(NnFp16), sizeof(NnFp16));
+            std::memcpy(&resultVal, result + i * sizeof(NnFp16), sizeof(NnFp16));
+            
+            float a = convertF16toF32Impl(resultVal);
+            float b = convertF16toF32Impl(inputVal);
+            float sum = a + b;
+            NnFp16 sumVal = convertF32ToF16Impl(sum);
+            
+            std::memcpy(result + i * sizeof(NnFp16), &sumVal, sizeof(NnFp16));
+        }
+        
+        // Handle remaining bytes (if any)
+        NnSize remainingBytes = nBytes % sizeof(NnFp16);
+        if (remainingBytes > 0) {
+            NnSize offset = nElements * sizeof(NnFp16);
+            for (NnSize i = 0; i < remainingBytes; i++) {
+                result[offset + i] = static_cast<NnByte>(result[offset + i] + input[offset + i]);
+            }
+        }
+    } else {
+        // Fallback: byte-wise addition (always safe for unknown types)
+        for (NnSize i = 0; i < nBytes; i++) {
+            result[i] = static_cast<NnByte>(result[i] + input[i]);
+        }
+    }
+}
+
+// Ring All-Reduce - O(n) with better bandwidth utilization (vLLM/TensorRT style)
+// Phase 1: Reduce-Scatter - Divide data into chunks, ring-pass to reduce
+// Phase 2: All-Gather - Ring-pass reduced chunks to collect full result
+// This provides better scalability than Star topology for large clusters
+static void syncNodeSlices_ringAllReduce(bool onlyFromWorkerToRoot, NnNetwork *network, NnUint nodeIndex, NnUint nNodes, NnByte *buffer, NnSize nBytes, NnFloatType floatType, NnUint nThreads, NnUint threadIndex) {
+    if (threadIndex != 0) return;  // Only thread 0 handles ring communication
+    
+    NnSize sliceBytes = nBytes / nNodes;
+    
+    // Ring topology: each node sends to next and receives from previous
+    NnUint sendToNode = (nodeIndex + 1) % nNodes;
+    NnUint recvFromNode = (nodeIndex + nNodes - 1) % nNodes;
+    
+    NnUint sendSocketIndex = getSocketIndexForNode(nodeIndex, sendToNode);
+    NnUint recvSocketIndex = getSocketIndexForNode(nodeIndex, recvFromNode);
+    
+    // ========== PHASE 1: REDUCE-SCATTER ==========
+    // Use thread_local vector for safe automatic memory management
+    // This avoids stack overflow and manual memory management issues
+    static thread_local std::vector<NnByte> tempBuffer;
+    if (tempBuffer.size() < sliceBytes) {
+        tempBuffer.reserve(sliceBytes);
+        tempBuffer.resize(sliceBytes, 0);
+    }
+    NnByte* tempBuffer_ptr = tempBuffer.data();
+    
+    // In n-1 steps, each node accumulates one chunk through reduction
+    for (NnUint step = 0; step < nNodes - 1; step++) {
+        // Determine which chunk to send and where to receive
+        NnUint sendChunkIndex = (nodeIndex - step + nNodes) % nNodes;
+        NnUint recvChunkIndex = (nodeIndex - step - 1 + nNodes) % nNodes;
+        
+        NnSocketIo sendIo, recvIo;
+        
+        // Use pre-allocated buffer
+        NnByte* alignedBuffer = tempBuffer_ptr;
+        
+        sendIo.socketIndex = sendSocketIndex;
+        sendIo.data = &buffer[sliceBytes * sendChunkIndex];
+        sendIo.size = sliceBytes;
+        
+        recvIo.socketIndex = recvSocketIndex;
+        recvIo.data = alignedBuffer;
+        recvIo.size = sliceBytes;
+        
+        // Even nodes send first, odd nodes receive first (avoid deadlock)
+        if (nodeIndex % 2 == 0) {
+            network->writeMany(1, &sendIo);
+            network->readMany(1, &recvIo);
+        } else {
+            network->readMany(1, &recvIo);
+            network->writeMany(1, &sendIo);
+        }
+        
+        // Reduce: add received chunk to corresponding local chunk
+        // Ensure we don't write beyond buffer bounds
+        if (sliceBytes * recvChunkIndex + sliceBytes <= nBytes) {
+            reduceSum(&buffer[sliceBytes * recvChunkIndex], alignedBuffer, sliceBytes, floatType);
+        }
+    }
+    
+    // At this point, each node has one fully reduced chunk
+    
+    if (onlyFromWorkerToRoot) {
+        return;  // If only reduce-scatter needed, we're done
+    }
+    
+    // ========== PHASE 2: ALL-GATHER ==========
+    // In n-1 steps, collect all reduced chunks
+    for (NnUint step = 0; step < nNodes - 1; step++) {
+        NnUint sendChunkIndex = (nodeIndex - step + nNodes) % nNodes;
+        NnUint recvChunkIndex = (nodeIndex - step - 1 + nNodes) % nNodes;
+        
+        NnSocketIo sendIo, recvIo;
+        
+        sendIo.socketIndex = sendSocketIndex;
+        sendIo.data = &buffer[sliceBytes * sendChunkIndex];
+        sendIo.size = sliceBytes;
+        
+        recvIo.socketIndex = recvSocketIndex;
+        recvIo.data = &buffer[sliceBytes * recvChunkIndex];
+        recvIo.size = sliceBytes;
+        
+        // Even nodes send first, odd nodes receive first
+        if (nodeIndex % 2 == 0) {
+            network->writeMany(1, &sendIo);
+            network->readMany(1, &recvIo);
+        } else {
+            network->readMany(1, &recvIo);
+            network->writeMany(1, &sendIo);
+        }
+    }
+    
+    // Now all nodes have the fully reduced result in all chunks
+}
+
+// Star Topology All-Reduce - O(n) Root-Centric with proper multithreading
+// Phase 1: Gather - All workers send their slice to root (root receives in parallel)
+// Phase 2: Reduce - Root performs element-wise sum reduction across all slices
+// Phase 3: Broadcast - Root broadcasts reduced result to all workers
+// This is more efficient than Gather-Broadcast for operations requiring reduction (sum)
+static void syncNodeSlices_starAllReduce(bool onlyFromWorkerToRoot, NnNetwork *network, NnUint nodeIndex, NnUint nNodes, NnByte *buffer, NnSize nBytes, NnFloatType floatType, NnUint nThreads, NnUint threadIndex) {
+    if (threadIndex != 0) return;  // Single-threaded to avoid races on shared buffers
+
+    // ========== PHASE 1: GATHER TO ROOT (FULL BUFFER) ==========
+    if (nodeIndex == 0) {
+        // ROOT: Collect full buffers from all workers and reduce into root buffer
+        static thread_local std::vector<NnByte> tempBuffer;
+        if (tempBuffer.size() < nBytes) {
+            tempBuffer.resize(nBytes, 0);
+        }
+
+        for (NnUint workerIdx = 1; workerIdx < nNodes; workerIdx++) {
+            NnSocketIo io;
+            io.socketIndex = workerIdx - 1;
+            io.data = tempBuffer.data();
+            io.size = nBytes;
+            network->readMany(1, &io);
+            reduceSum(buffer, tempBuffer.data(), nBytes, floatType);
+        }
+    } else {
+        // WORKER: Send full buffer to root
+        NnSocketIo io;
+        io.socketIndex = 0;
+        io.data = buffer;
+        io.size = nBytes;
+        network->writeMany(1, &io);
+    }
+    
+    // If only gathering to root (for reduction), we're done
+    if (onlyFromWorkerToRoot) {
+        return;
+    }
+    
+    // ========== PHASE 2: BROADCAST FROM ROOT ==========
+    if (nodeIndex == 0) {
+        // ROOT: Broadcast reduced result to all workers
+        for (NnUint workerIdx = 1; workerIdx < nNodes; workerIdx++) {
+            NnSocketIo io;
+            io.socketIndex = workerIdx - 1;
+            io.data = buffer;
+            io.size = nBytes;
+            network->writeMany(1, &io);
+        }
+    } else {
+        // WORKER: Receive reduced result
+        NnSocketIo io;
+        io.socketIndex = 0;
+        io.data = buffer;
+        io.size = nBytes;
+        network->readMany(1, &io);
+    }
+}
+
 // Star Topology Gather-Broadcast - O(n) Root-Centric with proper multithreading
 // Phase 1: All workers send their slice to root (root receives in parallel)
 // Phase 2: Root broadcasts complete buffer to all workers (workers receive)
@@ -1061,12 +1307,18 @@ static void syncNodeSlices_starGatherBroadcast(bool onlyFromWorkerToRoot, NnNetw
 }
 
 // Main syncNodeSlices function
-static void syncNodeSlices(bool onlyFromWorkerToRoot, NnNetwork *network, NnUint nodeIndex, NnUint nNodes, NnByte *buffer, NnSize nBytes, NnUint nThreads, NnUint threadIndex) {
-    // Use O(n) Star Gather-Broadcast
-    //syncNodeSlices_starGatherBroadcast(onlyFromWorkerToRoot, network, nodeIndex, nNodes, buffer, nBytes, nThreads, threadIndex);
-    
-    // Fallback O(n^2) if issues:
-    syncNodeSlices_alltoall(onlyFromWorkerToRoot, network, nodeIndex, nNodes, buffer, nBytes, nThreads, threadIndex);
+// Uses All-Reduce (with sum reduction) - optimized with vLLM/TensorRT style algorithms
+static void syncNodeSlices(bool onlyFromWorkerToRoot, NnNetwork *network, NnUint nodeIndex, NnUint nNodes, NnByte *buffer, NnSize nBytes, NnFloatType floatType, NnUint nThreads, NnUint threadIndex) {
+    if (nNodes <= 1 || nBytes == 0) return;
+
+    // Use All-Reduce to sum full buffers (vLLM/TensorRT style).
+    // Ring all-reduce requires equal chunk sizes; fall back to star if not divisible.
+    bool canUseRing = (nNodes >= 4) && (nBytes % nNodes == 0);
+    if (canUseRing) {
+        syncNodeSlices_ringAllReduce(onlyFromWorkerToRoot, network, nodeIndex, nNodes, buffer, nBytes, floatType, nThreads, threadIndex);
+    } else {
+        syncNodeSlices_starAllReduce(onlyFromWorkerToRoot, network, nodeIndex, nNodes, buffer, nBytes, floatType, nThreads, threadIndex);
+    }
 }
 
 NnNetworkNodeSynchronizer::NnNetworkNodeSynchronizer(NnNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig) {
@@ -1096,10 +1348,10 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
                 syncWithRoot(network, nodeConfig->nodeIndex, pipeBatch, batchBytes, nThreads, threadIndex);
             } else if (syncConfig->syncType == SYNC_NODE_SLICES) {
                 syncTypeName = "SYNC_NODE_SLICES";
-                syncNodeSlices(false, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, nThreads, threadIndex);
+                syncNodeSlices(false, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex);
             } else if (syncConfig->syncType == SYNC_NODE_SLICES_EXCEPT_ROOT) {
                 syncTypeName = "SYNC_NODE_SLICES_EXCEPT_ROOT";
-                syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, nThreads, threadIndex);
+                syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex);
             } else {
                 throw std::invalid_argument("Unknown sync type");
             }
@@ -1401,7 +1653,7 @@ void NnWorkerWeightReader::read() {
         if (nameSize == 0) {
             network->writeAck(ROOT_SOCKET_INDEX);
             if (tempSize > 0) {
-                delete temp;
+                delete[] temp;
                 tempSize = 0;
             }
             break;

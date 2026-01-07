@@ -138,6 +138,8 @@ bool hasPointerContinuousMemory(NnPointerConfig *config) {
         return true;
     if (config->type == PNTR_BATCH)
         return true;
+    if (config->type == PNTR_BATCHED_SLICE)
+        return true;
     return false;
 }
 

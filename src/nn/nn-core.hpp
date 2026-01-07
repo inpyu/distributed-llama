@@ -118,7 +118,7 @@ enum NnPointerType {
 
 enum NnSyncType {
     SYNC_WITH_ROOT, // whole pipe to all nodes
-    SYNC_NODE_SLICES, // my slice of pipe to all nodes
+    SYNC_NODE_SLICES, // all-reduce (sum) over full pipe buffer
     SYNC_NODE_SLICES_EXCEPT_ROOT, // only workers send slices to root, root does not send
 };
 

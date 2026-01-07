@@ -84,7 +84,7 @@ typedef struct {
     NnRowMatmulSlice w1Slice;
     NnColMatmulSlice w2Slice;
     NnRowMatmulSlice w3Slice;
-    NnRowMatmulSlice wclsSlice;
+    NnColMatmulSlice wclsSlice;
     NnUint positionPipeIndex;
     NnUint tokenPipeIndex;
     NnUint xPipeIndex;
