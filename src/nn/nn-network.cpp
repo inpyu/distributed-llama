@@ -1311,14 +1311,8 @@ static void syncNodeSlices_starGatherBroadcast(bool onlyFromWorkerToRoot, NnNetw
 static void syncNodeSlices(bool onlyFromWorkerToRoot, NnNetwork *network, NnUint nodeIndex, NnUint nNodes, NnByte *buffer, NnSize nBytes, NnFloatType floatType, NnUint nThreads, NnUint threadIndex) {
     if (nNodes <= 1 || nBytes == 0) return;
 
-    // Use All-Reduce to sum full buffers (vLLM/TensorRT style).
-    // Ring all-reduce requires equal chunk sizes; fall back to star if not divisible.
-    bool canUseRing = (nNodes >= 4) && (nBytes % nNodes == 0);
-    if (canUseRing) {
-        syncNodeSlices_ringAllReduce(onlyFromWorkerToRoot, network, nodeIndex, nNodes, buffer, nBytes, floatType, nThreads, threadIndex);
-    } else {
-        syncNodeSlices_starAllReduce(onlyFromWorkerToRoot, network, nodeIndex, nNodes, buffer, nBytes, floatType, nThreads, threadIndex);
-    }
+    // Use Star All-Reduce to sum full buffers (root-centric).
+    syncNodeSlices_starAllReduce(onlyFromWorkerToRoot, network, nodeIndex, nNodes, buffer, nBytes, floatType, nThreads, threadIndex);
 }
 
 NnNetworkNodeSynchronizer::NnNetworkNodeSynchronizer(NnNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig) {
