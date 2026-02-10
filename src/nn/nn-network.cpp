@@ -1308,18 +1308,27 @@ static void syncNodeSlices_starGatherBroadcast(bool onlyFromWorkerToRoot, NnNetw
 
 // Main syncNodeSlices function
 // Uses All-Reduce (with sum reduction) - optimized with vLLM/TensorRT style algorithms
-static void syncNodeSlices(bool onlyFromWorkerToRoot, NnNetwork *network, NnUint nodeIndex, NnUint nNodes, NnByte *buffer, NnSize nBytes, NnFloatType floatType, NnUint nThreads, NnUint threadIndex) {
+static void syncNodeSlices(bool onlyFromWorkerToRoot, NnNetwork *network, NnUint nodeIndex, NnUint nNodes, NnByte *buffer, NnSize nBytes, NnFloatType floatType, NnUint nThreads, NnUint threadIndex, NnCollectiveType collectiveType) {
     if (nNodes <= 1 || nBytes == 0) return;
 
-    // Use Star All-Reduce to sum full buffers (root-centric).
-    syncNodeSlices_starAllReduce(onlyFromWorkerToRoot, network, nodeIndex, nNodes, buffer, nBytes, floatType, nThreads, threadIndex);
+    NnCollectiveType effective = collectiveType;
+    if (effective == COLLECTIVE_AUTO) {
+        effective = nNodes <= 4 ? COLLECTIVE_STAR : COLLECTIVE_RING;
+    }
+
+    if (effective == COLLECTIVE_RING) {
+        syncNodeSlices_ringAllReduce(onlyFromWorkerToRoot, network, nodeIndex, nNodes, buffer, nBytes, floatType, nThreads, threadIndex);
+    } else {
+        syncNodeSlices_starAllReduce(onlyFromWorkerToRoot, network, nodeIndex, nNodes, buffer, nBytes, floatType, nThreads, threadIndex);
+    }
 }
 
-NnNetworkNodeSynchronizer::NnNetworkNodeSynchronizer(NnNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig) {
+NnNetworkNodeSynchronizer::NnNetworkNodeSynchronizer(NnNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnCollectiveType collectiveType) {
     this->network = network;
     this->execution = execution;
     this->netConfig = netConfig;
     this->nodeConfig = nodeConfig;
+    this->collectiveType = collectiveType;
 }
 
 void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUint threadIndex) {
@@ -1342,10 +1351,10 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
                 syncWithRoot(network, nodeConfig->nodeIndex, pipeBatch, batchBytes, nThreads, threadIndex);
             } else if (syncConfig->syncType == SYNC_NODE_SLICES) {
                 syncTypeName = "SYNC_NODE_SLICES";
-                syncNodeSlices(false, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex);
+                syncNodeSlices(false, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, collectiveType);
             } else if (syncConfig->syncType == SYNC_NODE_SLICES_EXCEPT_ROOT) {
                 syncTypeName = "SYNC_NODE_SLICES_EXCEPT_ROOT";
-                syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex);
+                syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex, collectiveType);
             } else {
                 throw std::invalid_argument("Unknown sync type");
             }

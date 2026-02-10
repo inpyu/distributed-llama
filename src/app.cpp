@@ -21,6 +21,13 @@ static ChatTemplateType parseChatTemplateType(char *val) {
     throw std::runtime_error("Invalid chat template type: " + std::string(val));
 }
 
+static NnCollectiveType parseCollectiveType(char *val) {
+    if (std::strcmp(val, "star") == 0) return COLLECTIVE_STAR;
+    if (std::strcmp(val, "ring") == 0) return COLLECTIVE_RING;
+    if (std::strcmp(val, "auto") == 0) return COLLECTIVE_AUTO;
+    throw std::runtime_error("Invalid collective type: " + std::string(val));
+}
+
 AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     AppCliArgs args;
     args.info = true;
@@ -32,6 +39,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.tokenizerPath = nullptr;
     args.prompt = nullptr;
     args.syncType = F_32;
+    args.collectiveType = COLLECTIVE_STAR;
     args.nWorkers = 0;
     args.workerHosts = nullptr;
     args.workerPorts = nullptr;
@@ -72,6 +80,8 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             args.prompt = value;
         } else if (std::strcmp(name, "--buffer-float-type") == 0) {
             args.syncType = parseFloatType(value);
+        } else if (std::strcmp(name, "--collective") == 0) {
+            args.collectiveType = parseCollectiveType(value);
         } else if (std::strcmp(name, "--workers") == 0) {
             int j = i + 1;
             for (; j < argc && argv[j][0] != '-'; j++);
@@ -264,7 +274,7 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     } else {
         networkPtr = NnNetwork::connect(args->nWorkers, args->workerHosts, args->workerPorts);
         network = networkPtr.get();
-        synchronizer.reset(new NnNetworkNodeSynchronizer(network, &execution, &net.netConfig, rootNodeConfig));
+        synchronizer.reset(new NnNetworkNodeSynchronizer(network, &execution, &net.netConfig, rootNodeConfig, args->collectiveType));
 
         NnRootConfigWriter configWriter(network);
         configWriter.writeToWorkers(&net.netConfig, net.nodeConfigs);
@@ -326,7 +336,7 @@ void runWorkerApp(AppCliArgs *args) {
         NnNetExecution execution(args->nThreads, &netConfig);
 
         std::vector<NnExecutorDevice> devices = resolveDevices(args, &netConfig, &nodeConfig, &execution);
-        NnNetworkNodeSynchronizer synchronizer(network, &execution, &netConfig, &nodeConfig);
+        NnNetworkNodeSynchronizer synchronizer(network, &execution, &netConfig, &nodeConfig, args->collectiveType);
         NnExecutor executor(&netConfig, &nodeConfig, &devices, &execution, &synchronizer, false);
 
         NnWorkerWeightReader weightReader(&executor, network);

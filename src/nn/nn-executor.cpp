@@ -2,6 +2,8 @@
 #include <cstring>
 #include "nn-executor.hpp"
 
+static inline void executeStep(NnExecutorStep *step, NnUint nThreads, NnExecutorThread *thread, NnExecutorContext *context);
+
 void NnFakeNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUint threadIndex) {
     // Nothing
 }
@@ -89,23 +91,106 @@ NnExecutor::NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::ve
     context.synchronizer = synchronizer;
     context.nSteps = (NnUint)steps.size();
     context.steps = steps.data();
+    context.epoch.store(0);
+    context.doneRunThreadCount.store(0);
     if (benchmark)
         context.timer = new Timer();
     else
         context.timer = nullptr;
 
-    threads = new NnExecutorThread[netExecution->nThreads];
+    context.isAlive.store(true);
+    context.isShutdown.store(false);
+    context.isRunDone.store(true);
+
+    threads.resize(netExecution->nThreads);
     for (NnUint threadIndex = 0; threadIndex < netExecution->nThreads; threadIndex++) {
-        NnExecutorThread *thread = &threads[threadIndex];
-        thread->threadIndex = threadIndex;
-        thread->context = &context;
+        threads[threadIndex].threadIndex = threadIndex;
+        threads[threadIndex].context = &context;
+    }
+
+    threadHandles.reserve(netExecution->nThreads);
+    for (NnUint threadIndex = 0; threadIndex < netExecution->nThreads; threadIndex++) {
+        threadHandles.emplace_back([this, threadIndex]() {
+            NnExecutorThread *thread = &this->threads[threadIndex];
+            NnExecutorContext *ctx = thread->context;
+            NnUint localEpoch = 0;
+
+            while (true) {
+                {
+                    std::unique_lock<std::mutex> lock(ctx->mutex);
+                    ctx->cv.wait(lock, [ctx, localEpoch]() {
+                        return ctx->isShutdown.load() || ctx->epoch.load() != localEpoch;
+                    });
+                }
+
+                if (ctx->isShutdown.load())
+                    break;
+
+                localEpoch = ctx->epoch.load();
+
+                NnUint nThreads = ctx->nThreads;
+                NnUint doneCount = nThreads - 1;
+
+                while (ctx->isAlive.load()) {
+                    const NnUint currentStepIndex = ctx->currentStepIndex.load();
+                    if (currentStepIndex == ctx->nSteps)
+                        break;
+
+                    NnExecutorStep *step = &ctx->steps[currentStepIndex];
+                    try {
+                        executeStep(step, nThreads, thread, ctx);
+                    } catch (const std::runtime_error &e) {
+                        ctx->isAlive.store(false);
+                        printf("🚨 Execution error: %s\n", e.what());
+                        ctx->cv.notify_all();
+                        break;
+                    }
+
+                    NnUint currentCount = ctx->doneThreadCount.fetch_add(1);
+                    if (currentCount == doneCount) {
+                        if (ctx->timer != nullptr) {
+                            NnUint time = ctx->timer->elapsedMicroseconds();
+                            ctx->totalTime[step->type] += time;
+                            ctx->timer->reset();
+                        }
+
+                        ctx->doneThreadCount.store(0);
+                        ctx->currentStepIndex.fetch_add(1);
+                        ctx->cv.notify_all();
+                    } else {
+                        std::unique_lock<std::mutex> lock(ctx->mutex);
+                        ctx->cv.wait(lock, [ctx, currentStepIndex, localEpoch]() {
+                            return ctx->isShutdown.load() ||
+                                   !ctx->isAlive.load() ||
+                                   ctx->epoch.load() != localEpoch ||
+                                   ctx->currentStepIndex.load() != currentStepIndex;
+                        });
+                        if (ctx->isShutdown.load() || ctx->epoch.load() != localEpoch)
+                            break;
+                    }
+                }
+
+                NnUint runCount = ctx->doneRunThreadCount.fetch_add(1);
+                if (runCount == doneCount) {
+                    ctx->isRunDone.store(true);
+                    ctx->cv.notify_all();
+                }
+            }
+        });
     }
 }
 
 NnExecutor::~NnExecutor() {
     if (context.timer != nullptr)
         delete context.timer;
-    delete[] threads;
+
+    context.isShutdown.store(true);
+    context.epoch.fetch_add(1);
+    context.cv.notify_all();
+    for (std::thread &t : threadHandles) {
+        if (t.joinable())
+            t.join();
+    }
 }
 
 void NnExecutor::loadWeight(const char *name, NnUint opIndex, NnSize offset, NnSize nBytes, NnByte *weight) {
@@ -124,7 +209,7 @@ void NnExecutor::loadWeight(const char *name, NnUint opIndex, NnSize offset, NnS
     throw std::invalid_argument("Cannot locate op by name: " + std::string(name));
 }
 
-inline void executeStep(NnExecutorStep *step, NnUint nThreads, NnExecutorThread *thread, NnExecutorContext *context) {
+static inline void executeStep(NnExecutorStep *step, NnUint nThreads, NnExecutorThread *thread, NnExecutorContext *context) {
     if (step->type == STEP_EXECUTE_OP) {
         step->segment->forward(step->arg0, nThreads, thread->threadIndex, context->batchSize);
     } else if (step->type == STEP_SYNC_NODES) {
@@ -134,68 +219,33 @@ inline void executeStep(NnExecutorStep *step, NnUint nThreads, NnExecutorThread 
     }
 }
 
-static inline void *executorThreadHandler(void *arg) {
-    NnExecutorThread *thread = (NnExecutorThread *)arg;
-    NnExecutorContext *context = thread->context;
-    NnUint nThreads = context->nThreads;
-    NnUint doneCount = nThreads - 1;
-
-    while (context->isAlive.load()) {
-        const unsigned int currentStepIndex = context->currentStepIndex.load();
-        if (currentStepIndex == context->nSteps)
-            break;
-
-        NnExecutorStep *step = &context->steps[currentStepIndex];
-        try {
-            executeStep(step, nThreads, thread, context);
-        } catch (const std::runtime_error &e) {
-            context->isAlive.store(false);
-            printf("🚨 Execution error: %s\n", e.what());
-            break;
-        }
-
-        NnUint currentCount = context->doneThreadCount.fetch_add(1);
-        if (currentCount == doneCount) {
-            if (context->timer != nullptr) {
-                NnUint time = context->timer->elapsedMicroseconds();
-                context->totalTime[step->type] += time;
-                context->timer->reset();
-            }
-
-            context->doneThreadCount.store(0);
-            context->currentStepIndex.fetch_add(1);
-        } else {
-            while (
-                context->currentStepIndex.load() == currentStepIndex &&
-                context->isAlive.load()
-            );
-        }
-    }
-    return nullptr;
-}
-
 void NnExecutor::forward() {
     assert(netExecution->batchSize > 0);
 
-    NnUint nThreads = netExecution->nThreads;
-    context.isAlive.exchange(true);
-    context.currentStepIndex.exchange(0);
-    context.doneThreadCount.exchange(0);
-    context.batchSize = netExecution->batchSize;
+    {
+        std::lock_guard<std::mutex> lock(context.mutex);
+        context.isAlive.store(true);
+        context.currentStepIndex.store(0);
+        context.doneThreadCount.store(0);
+        context.doneRunThreadCount.store(0);
+        context.isRunDone.store(false);
+        context.batchSize = netExecution->batchSize;
 
-    if (context.timer != nullptr) {
-        std::memset(context.totalTime, 0, sizeof(context.totalTime));
-        context.timer->reset();
-    }
+        if (context.timer != nullptr) {
+            std::memset(context.totalTime, 0, sizeof(context.totalTime));
+            context.timer->reset();
+        }
 
-    NnUint threadIndex;
-    for (threadIndex = 1; threadIndex < nThreads; threadIndex++) {
-        int result = pthread_create(&threads[threadIndex].handler, NULL, (PthreadFunc)executorThreadHandler, (void *)&threads[threadIndex]);
-        assert(result == 0 && "Failed to create thread");
+        context.epoch.fetch_add(1);
     }
-    executorThreadHandler((void *)&threads[0]);
-    for (threadIndex = 1; threadIndex < nThreads; threadIndex++)
-        pthread_join(threads[threadIndex].handler, NULL);
+    context.cv.notify_all();
+
+    std::unique_lock<std::mutex> lock(context.mutex);
+    context.cv.wait(lock, [this]() {
+        return this->context.isShutdown.load() ||
+               this->context.isRunDone.load() ||
+               !this->context.isAlive.load();
+    });
 
     if (!context.isAlive.load())
         throw NnExecutorException("Execution failed in one of the threads");
