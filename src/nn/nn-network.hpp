@@ -119,9 +119,8 @@ private:
     NnNetExecution *execution;
     NnNetConfig *netConfig;
     NnNodeConfig *nodeConfig;
-    NnCollectiveType collectiveType;
 public:
-    NnNetworkNodeSynchronizer(NnNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, NnCollectiveType collectiveType);
+    NnNetworkNodeSynchronizer(NnNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig);
     ~NnNetworkNodeSynchronizer() override {};
     void sync(NnUint segmentIndex, NnUint nThreads, NnUint threadIndex) override;
 };

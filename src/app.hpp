@@ -20,7 +20,6 @@ public:
     char *tokenizerPath;
     char *prompt;
     NnFloatType syncType;
-    NnCollectiveType collectiveType;
     NnUint nWorkers;
     char **workerHosts;
     NnUint *workerPorts;

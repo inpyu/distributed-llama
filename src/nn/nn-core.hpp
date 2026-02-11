@@ -122,12 +122,6 @@ enum NnSyncType {
     SYNC_NODE_SLICES_EXCEPT_ROOT, // only workers send slices to root, root does not send
 };
 
-enum NnCollectiveType {
-    COLLECTIVE_STAR,
-    COLLECTIVE_RING,
-    COLLECTIVE_AUTO,
-};
-
 enum NnRopeType {
     ROPE_LLAMA = 0,
     ROPE_FALCON = 1,

@@ -3,9 +3,6 @@
 
 #include "nn-core.hpp"
 #include <atomic>
-#include <condition_variable>
-#include <mutex>
-#include <thread>
 #include <vector>
 #include <stdexcept>
 #include "pthread.h"
@@ -77,22 +74,16 @@ typedef struct {
     NnNodeSynchronizer *synchronizer;
     std::atomic_uint currentStepIndex;
     std::atomic_uint doneThreadCount;
-    std::atomic_uint epoch;
-    std::atomic_uint doneRunThreadCount;
     std::atomic_bool isAlive;
-    std::atomic_bool isShutdown;
-    std::atomic_bool isRunDone;
     NnUint batchSize;
     Timer *timer;
     NnUint totalTime[N_STEP_TYPES];
-
-    std::mutex mutex;
-    std::condition_variable cv;
 } NnExecutorContext;
 
 typedef struct {
     NnUint threadIndex;
     NnExecutorContext *context;
+    PthreadHandler handler;
 } NnExecutorThread;
 
 class NnExecutorException : public std::runtime_error {
@@ -106,8 +97,7 @@ private:
     NnNodeConfig *nodeConfig;
     std::vector<std::unique_ptr<NnDeviceSegment>> segments;
     std::vector<NnExecutorStep> steps;
-    std::vector<NnExecutorThread> threads;
-    std::vector<std::thread> threadHandles;
+    NnExecutorThread *threads;
     NnExecutorContext context;
 public:
     NnExecutor(NnNetConfig *netConfig, NnNodeConfig *nodeConfig, std::vector<NnExecutorDevice> *device, NnNetExecution *netExecution, NnNodeSynchronizer *synchronizer, bool benchmark);
