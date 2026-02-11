@@ -67,6 +67,8 @@ The project is split up into two parts:
 * **🔸 Root node** - it's responsible for loading the model and weights and forward them to workers. Also, it synchronizes the state of the neural network. The root node is also a worker, it processes own slice of the neural network.
 * **🔹 Worker node** - it processes own slice of the neural network. It doesn't require any configuration related to the model.
 
+Note: the root and all workers must run binaries built from the same source revision/flags. A mismatch can corrupt the transmitted net/node config and crash workers (e.g. `Assertion failed: 0 != 32 (src/nn/nn-cpu.cpp:188)`).
+
 You always need the root node and you can add 2^n - 1 worker nodes to speed up the inference. The RAM usage of the neural network is split up across all nodes. The root node requires a bit more RAM than worker nodes.
 
 ### 🎹 Commands
@@ -101,6 +103,7 @@ Worker, API
 | Argument                     | Description                       | Example           |
 | ---------------------------- | --------------------------------- | ----------------- |
 | `--port <port>`              | Binding port.                     | `9999`            |
+| `--net-turbo <0|1>`          | Use non-blocking sockets (can be unstable on some networks; try `0` if generation stalls). | `0` |
 
 Inference
 

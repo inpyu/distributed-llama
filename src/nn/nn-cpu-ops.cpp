@@ -1120,6 +1120,8 @@ static void initMatmulForward(NnCpuOpContext *context) {
 static bool matmulForward_llamafile(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
     if (!context->hasInputContinuousMemory || !context->hasOutputContinuousMemory || context->inputSize.z != 1u)
         return false;
+    if (nThreads > 1u)
+        return false;
 
     const NnUint n = context->weightSize.y / getBlockSize(context->inputSize.floatType);
     const NnUint d = context->weightSize.x;
@@ -1258,6 +1260,12 @@ static void initMultiHeadAttForward(NnCpuOpContext *context) {
 }
 
 static void multiHeadAttForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
+    // Multi-head attention path has intermittent hangs under multi-threaded
+    // execution on some CPU/network combinations. Keep this op single-threaded
+    // for correctness; other ops still use full thread parallelism.
+    if (threadIndex != 0)
+        return;
+
     const NnMultiHeadAttOpConfig *config = (NnMultiHeadAttOpConfig *)context->opConfig;
 
     float *query = (float *)context->buffers[config->queryBufferIndex];
@@ -1279,7 +1287,7 @@ static void multiHeadAttForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnU
             &att[batchIndex * config->nHeads0 * config->seqLen],
             keyCache, valueCache, pos,
             config->nHeads, config->nHeads0,
-            config->nKvHeads, config->kvDim0, config->headDim, config->seqLen, nThreads, threadIndex);
+            config->nKvHeads, config->kvDim0, config->headDim, config->seqLen, 1u, 0u);
 
         DEBUG_VECTOR(context, "output", y);
     }

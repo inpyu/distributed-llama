@@ -1,5 +1,6 @@
 #include <cassert>
 #include <cstring>
+#include <cstdlib>
 #include "nn-executor.hpp"
 
 static inline void executeStep(NnExecutorStep *step, NnUint nThreads, NnExecutorThread *thread, NnExecutorContext *context);
@@ -221,6 +222,7 @@ static inline void executeStep(NnExecutorStep *step, NnUint nThreads, NnExecutor
 
 void NnExecutor::forward() {
     assert(netExecution->batchSize > 0);
+    const bool debugHang = std::getenv("DLLAMA_DEBUG_HANG") != nullptr;
 
     {
         std::lock_guard<std::mutex> lock(context.mutex);
@@ -241,11 +243,31 @@ void NnExecutor::forward() {
     context.cv.notify_all();
 
     std::unique_lock<std::mutex> lock(context.mutex);
-    context.cv.wait(lock, [this]() {
-        return this->context.isShutdown.load() ||
-               this->context.isRunDone.load() ||
-               !this->context.isAlive.load();
-    });
+    while (!(context.isShutdown.load() || context.isRunDone.load() || !context.isAlive.load())) {
+        if (!context.cv.wait_for(lock, std::chrono::seconds(5), [this]() {
+                return this->context.isShutdown.load() ||
+                       this->context.isRunDone.load() ||
+                       !this->context.isAlive.load();
+            }) && debugHang) {
+            const NnUint stepIndex = context.currentStepIndex.load();
+            if (stepIndex < context.nSteps) {
+                NnExecutorStep *step = &context.steps[stepIndex];
+                if (step->type == STEP_EXECUTE_OP && step->opConfig != nullptr) {
+                    printf("⚠️ Executor timeout: node=%u step=%u OP name=%s index=%u\n",
+                        nodeConfig->nodeIndex, stepIndex, step->opConfig->name, step->opConfig->index);
+                } else if (step->type == STEP_SYNC_NODES) {
+                    printf("⚠️ Executor timeout: node=%u step=%u SYNC segment=%u\n",
+                        nodeConfig->nodeIndex, stepIndex, step->arg0);
+                } else {
+                    printf("⚠️ Executor timeout: node=%u step=%u type=%u\n",
+                        nodeConfig->nodeIndex, stepIndex, step->type);
+                }
+            } else {
+                printf("⚠️ Executor timeout: node=%u waiting completion after final step\n", nodeConfig->nodeIndex);
+            }
+            fflush(stdout);
+        }
+    }
 
     if (!context.isAlive.load())
         throw NnExecutorException("Execution failed in one of the threads");

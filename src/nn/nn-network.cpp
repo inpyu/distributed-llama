@@ -12,6 +12,7 @@ typedef SSIZE_T ssize_t;
 #endif
 #include "nn-network.hpp"
 #include <cassert>
+#include <cstdint>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
@@ -20,12 +21,32 @@ typedef SSIZE_T ssize_t;
 #include <iomanip>
 #include <algorithm>
 #include <map>
+#include <thread>
+#ifndef _WIN32
+#include <poll.h>
+#endif
 
 #define SOCKET_LAST_ERRCODE errno
 #define SOCKET_LAST_ERROR strerror(errno)
 
 #define ACK 23571114
 #define MAX_CHUNK_SIZE 4096
+
+static inline void waitSocketReady(int socket, bool forWrite) {
+#ifdef _WIN32
+    WSAPOLLFD pfd;
+    pfd.fd = socket;
+    pfd.events = forWrite ? POLLWRNORM : POLLRDNORM;
+    pfd.revents = 0;
+    WSAPoll(&pfd, 1, 10);
+#else
+    struct pollfd pfd;
+    pfd.fd = socket;
+    pfd.events = forWrite ? POLLOUT : POLLIN;
+    pfd.revents = 0;
+    poll(&pfd, 1, 10);
+#endif
+}
 
 static inline bool isEagainError() {
     #ifdef _WIN32
@@ -90,6 +111,7 @@ void writeSocket(int socket, const void *data, NnSize size) {
         ssize_t s = send(socket, (const char*)data, size, 0);
         if (s < 0) {
             if (isEagainError()) {
+                waitSocketReady(socket, true);
                 continue;
             }
             throw NnTransferSocketException(0, "Error writing to socket");
@@ -114,6 +136,7 @@ static inline bool tryReadSocket(int socket, void *data, NnSize size, unsigned l
                         return false;
                     }
                 }
+                waitSocketReady(socket, false);
                 continue;
             }
             throw NnTransferSocketException(0, "Error reading from socket");
@@ -479,6 +502,7 @@ void NnNetwork::writeMany(NnUint n, NnSocketIo *ios) {
                 ssize_t s = send(socket, (const char*)io->data, chunkSize, 0);
                 if (s < 0) {
                     if (isEagainError()) {
+                        waitSocketReady(socket, true);
                         continue;
                     }
                     throw NnTransferSocketException(SOCKET_LAST_ERRCODE, SOCKET_LAST_ERROR);
@@ -524,6 +548,7 @@ void NnNetwork::readMany(NnUint n, NnSocketIo *ios) {
                 ssize_t r = recv(socket, (char*)io->data, io->size, 0);
                 if (r < 0) {
                     if (isEagainError()) {
+                        waitSocketReady(socket, false);
                         continue;
                     }
                     throw NnTransferSocketException(SOCKET_LAST_ERRCODE, SOCKET_LAST_ERROR);
@@ -1313,7 +1338,9 @@ static void syncNodeSlices(bool onlyFromWorkerToRoot, NnNetwork *network, NnUint
 
     NnCollectiveType effective = collectiveType;
     if (effective == COLLECTIVE_AUTO) {
-        effective = nNodes <= 4 ? COLLECTIVE_STAR : COLLECTIVE_RING;
+        // Keep AUTO on STAR for stability. RING path is experimental and can
+        // deadlock on larger multi-node topologies in real deployments.
+        effective = COLLECTIVE_STAR;
     }
 
     if (effective == COLLECTIVE_RING) {
@@ -1384,59 +1411,117 @@ static char *readString(NnNetwork *network, NnUint socketIndex) {
     return str;
 }
 
+// IMPORTANT:
+// Do not send raw C/C++ structs over the wire. Root and workers may be built
+// with different ABIs (enum sizes, padding, sizeof(size_t)), which breaks
+// deserialization and can silently corrupt sizes/indices.
+static inline void writeI32(NnNetwork *network, NnUint socketIndex, std::int32_t v) {
+    network->write(socketIndex, &v, sizeof(v));
+}
+
+static inline std::int32_t readI32(NnNetwork *network, NnUint socketIndex) {
+    std::int32_t v;
+    network->read(socketIndex, &v, sizeof(v));
+    return v;
+}
+
+static inline void writeU32(NnNetwork *network, NnUint socketIndex, std::uint32_t v) {
+    network->write(socketIndex, &v, sizeof(v));
+}
+
+static inline std::uint32_t readU32(NnNetwork *network, NnUint socketIndex) {
+    std::uint32_t v;
+    network->read(socketIndex, &v, sizeof(v));
+    return v;
+}
+
+static inline void writePointerConfig(NnNetwork *network, NnUint socketIndex, const NnPointerConfig &c) {
+    writeI32(network, socketIndex, (std::int32_t)c.source);
+    writeU32(network, socketIndex, (std::uint32_t)c.pointerIndex);
+    writeI32(network, socketIndex, (std::int32_t)c.type);
+}
+
+static inline NnPointerConfig readPointerConfig(NnNetwork *network, NnUint socketIndex) {
+    NnPointerConfig c;
+    c.source = (NnPointerSource)readI32(network, socketIndex);
+    c.pointerIndex = (NnUint)readU32(network, socketIndex);
+    c.type = (NnPointerType)readI32(network, socketIndex);
+    return c;
+}
+
+static inline void writeSize3DWire(NnNetwork *network, NnUint socketIndex, const NnSize3D &s) {
+    writeI32(network, socketIndex, (std::int32_t)s.floatType);
+    writeU32(network, socketIndex, (std::uint32_t)s.z);
+    writeU32(network, socketIndex, (std::uint32_t)s.y);
+    writeU32(network, socketIndex, (std::uint32_t)s.x);
+}
+
+static inline NnSize3D readSize3DWire(NnNetwork *network, NnUint socketIndex) {
+    NnFloatType floatType = (NnFloatType)readI32(network, socketIndex);
+    NnUint z = (NnUint)readU32(network, socketIndex);
+    NnUint y = (NnUint)readU32(network, socketIndex);
+    NnUint x = (NnUint)readU32(network, socketIndex);
+
+    if (floatType == F_UNK) {
+        NnSize len = (NnSize)z * (NnSize)y * (NnSize)x;
+        return { floatType, z, y, x, len, 0, 0 };
+    }
+    return size3D(floatType, z, y, x);
+}
+
 NnRootConfigWriter::NnRootConfigWriter(NnNetwork *network) {
     this->network = network;
 }
 
 void NnRootConfigWriter::writeNet(NnUint socketIndex, NnNetConfig *config) {
     network->writeAck(socketIndex);
-    network->write(socketIndex, &config->nBatches, sizeof(config->nBatches));
-    network->write(socketIndex, &config->nNodes, sizeof(config->nNodes));
-    network->write(socketIndex, &config->nPipes, sizeof(config->nPipes));
+    writeU32(network, socketIndex, (std::uint32_t)config->nBatches);
+    writeU32(network, socketIndex, (std::uint32_t)config->nNodes);
+    writeU32(network, socketIndex, (std::uint32_t)config->nPipes);
     for (NnUint pipeIndex = 0; pipeIndex < config->nPipes; pipeIndex++) {
         NnPipeConfig *pipeConfig = &config->pipes[pipeIndex];
-        network->write(socketIndex, &pipeConfig->size, sizeof(pipeConfig->size));
+        writeSize3DWire(network, socketIndex, pipeConfig->size);
         writeString(network, socketIndex, pipeConfig->name);
     }
-    network->write(socketIndex, &config->nPreSyncs, sizeof(config->nPreSyncs));
+    writeU32(network, socketIndex, (std::uint32_t)config->nPreSyncs);
     for (NnUint preSyncIndex = 0; preSyncIndex < config->nPreSyncs; preSyncIndex++) {
         NnPreSyncConfig *preSyncConfig = &config->preSyncs[preSyncIndex];
-        network->write(socketIndex, &preSyncConfig->pipeIndex, sizeof(preSyncConfig->pipeIndex));
+        writeU32(network, socketIndex, (std::uint32_t)preSyncConfig->pipeIndex);
     }
     network->readAck(socketIndex);
 }
 
 void NnRootConfigWriter::writeNode(NnUint socketIndex, NnNodeConfig *config) {
     network->writeAck(socketIndex);
-    network->write(socketIndex, &config->nodeIndex, sizeof(config->nodeIndex));
-    network->write(socketIndex, &config->nBuffers, sizeof(config->nBuffers));
-    network->write(socketIndex, &config->nSegments, sizeof(config->nSegments));
+    writeU32(network, socketIndex, (std::uint32_t)config->nodeIndex);
+    writeU32(network, socketIndex, (std::uint32_t)config->nBuffers);
+    writeU32(network, socketIndex, (std::uint32_t)config->nSegments);
 
     for (NnUint bufferIndex = 0; bufferIndex < config->nBuffers; bufferIndex++) {
         NnBufferConfig *bufferConfig = &config->buffers[bufferIndex];
-        network->write(socketIndex, &bufferConfig->size, sizeof(bufferConfig->size));
+        writeSize3DWire(network, socketIndex, bufferConfig->size);
         writeString(network, socketIndex, bufferConfig->name);
     }
 
     for (NnUint segmentIndex = 0; segmentIndex < config->nSegments; segmentIndex++) {
         NnSegmentConfig *segmentConfig = &config->segments[segmentIndex];
-        network->write(socketIndex, &segmentConfig->nSyncs, sizeof(segmentConfig->nSyncs));
-        network->write(socketIndex, &segmentConfig->nOps, sizeof(segmentConfig->nOps));
+        writeU32(network, socketIndex, (std::uint32_t)segmentConfig->nSyncs);
+        writeU32(network, socketIndex, (std::uint32_t)segmentConfig->nOps);
 
         for (NnUint syncIndex = 0; syncIndex < segmentConfig->nSyncs; syncIndex++) {
             NnSyncConfig *syncConfig = &segmentConfig->syncs[syncIndex];
-            network->write(socketIndex, &syncConfig->pipeIndex, sizeof(syncConfig->pipeIndex));
-            network->write(socketIndex, &syncConfig->syncType, sizeof(syncConfig->syncType));
+            writeU32(network, socketIndex, (std::uint32_t)syncConfig->pipeIndex);
+            writeI32(network, socketIndex, (std::int32_t)syncConfig->syncType);
         }
         for (NnUint opIndex = 0; opIndex < segmentConfig->nOps; opIndex++) {
             NnOpConfig *opConfig = &segmentConfig->ops[opIndex];
-            network->write(socketIndex, &opConfig->code, sizeof(opConfig->code));
-            network->write(socketIndex, &opConfig->index, sizeof(opConfig->index));
-            network->write(socketIndex, &opConfig->weightSize, sizeof(opConfig->weightSize));
-            network->write(socketIndex, &opConfig->configSize, sizeof(opConfig->configSize));
+            writeI32(network, socketIndex, (std::int32_t)opConfig->code);
+            writeU32(network, socketIndex, (std::uint32_t)opConfig->index);
+            writeSize3DWire(network, socketIndex, opConfig->weightSize);
+            writeU32(network, socketIndex, (std::uint32_t)opConfig->configSize);
             writeString(network, socketIndex, opConfig->name);
-            network->write(socketIndex, &opConfig->input, sizeof(opConfig->input));
-            network->write(socketIndex, &opConfig->output, sizeof(opConfig->output));
+            writePointerConfig(network, socketIndex, opConfig->input);
+            writePointerConfig(network, socketIndex, opConfig->output);
             if (opConfig->configSize > 0)
                 network->write(socketIndex, opConfig->config, opConfig->configSize);
         }
@@ -1459,20 +1544,20 @@ NnWorkerConfigReader::NnWorkerConfigReader(NnNetwork *network) {
 NnNetConfig NnWorkerConfigReader::readNet() {
     network->readAck(ROOT_SOCKET_INDEX);
     NnNetConfig config;
-    network->read(ROOT_SOCKET_INDEX, &config.nBatches, sizeof(config.nBatches));
-    network->read(ROOT_SOCKET_INDEX, &config.nNodes, sizeof(config.nNodes));
-    network->read(ROOT_SOCKET_INDEX, &config.nPipes, sizeof(config.nPipes));
+    config.nBatches = (NnUint)readU32(network, ROOT_SOCKET_INDEX);
+    config.nNodes = (NnUint)readU32(network, ROOT_SOCKET_INDEX);
+    config.nPipes = (NnUint)readU32(network, ROOT_SOCKET_INDEX);
     config.pipes = new NnPipeConfig[config.nPipes];
     for (NnUint pipeIndex = 0; pipeIndex < config.nPipes; pipeIndex++) {
         NnPipeConfig *pipeConfig = &config.pipes[pipeIndex];
-        network->read(ROOT_SOCKET_INDEX, &pipeConfig->size, sizeof(pipeConfig->size));
+        pipeConfig->size = readSize3DWire(network, ROOT_SOCKET_INDEX);
         pipeConfig->name = readString(network, ROOT_SOCKET_INDEX);
     }
-    network->read(ROOT_SOCKET_INDEX, &config.nPreSyncs, sizeof(config.nPreSyncs));
-    config.preSyncs = new NnPreSyncConfig[config.nPreSyncs];
+    config.nPreSyncs = (NnUint)readU32(network, ROOT_SOCKET_INDEX);
+    config.preSyncs = config.nPreSyncs > 0 ? new NnPreSyncConfig[config.nPreSyncs] : nullptr;
     for (NnUint preSyncIndex = 0; preSyncIndex < config.nPreSyncs; preSyncIndex++) {
         NnPreSyncConfig *preSyncConfig = &config.preSyncs[preSyncIndex];
-        network->read(ROOT_SOCKET_INDEX, &preSyncConfig->pipeIndex, sizeof(preSyncConfig->pipeIndex));
+        preSyncConfig->pipeIndex = (NnUint)readU32(network, ROOT_SOCKET_INDEX);
     }
     network->writeAck(ROOT_SOCKET_INDEX);
     return config;
@@ -1482,31 +1567,31 @@ NnNodeConfig NnWorkerConfigReader::readNode() {
     network->readAck(ROOT_SOCKET_INDEX);
 
     NnNodeConfig config;
-    network->read(ROOT_SOCKET_INDEX, &config.nodeIndex, sizeof(config.nodeIndex));
-    network->read(ROOT_SOCKET_INDEX, &config.nBuffers, sizeof(config.nBuffers));
-    network->read(ROOT_SOCKET_INDEX, &config.nSegments, sizeof(config.nSegments));
+    config.nodeIndex = (NnUint)readU32(network, ROOT_SOCKET_INDEX);
+    config.nBuffers = (NnUint)readU32(network, ROOT_SOCKET_INDEX);
+    config.nSegments = (NnUint)readU32(network, ROOT_SOCKET_INDEX);
 
     config.buffers = new NnBufferConfig[config.nBuffers];
     config.segments = new NnSegmentConfig[config.nSegments];
 
     for (NnUint bufferIndex = 0; bufferIndex < config.nBuffers; bufferIndex++) {
         NnBufferConfig *bufferConfig = &config.buffers[bufferIndex];
-        network->read(ROOT_SOCKET_INDEX, &bufferConfig->size, sizeof(bufferConfig->size));
+        bufferConfig->size = readSize3DWire(network, ROOT_SOCKET_INDEX);
         bufferConfig->name = readString(network, ROOT_SOCKET_INDEX);
     }
 
     for (NnUint segmentIndex = 0; segmentIndex < config.nSegments; segmentIndex++) {
         NnSegmentConfig *segmentConfig = &config.segments[segmentIndex];
-        network->read(ROOT_SOCKET_INDEX, &segmentConfig->nSyncs, sizeof(segmentConfig->nSyncs));
-        network->read(ROOT_SOCKET_INDEX, &segmentConfig->nOps, sizeof(segmentConfig->nOps));
+        segmentConfig->nSyncs = (NnUint)readU32(network, ROOT_SOCKET_INDEX);
+        segmentConfig->nOps = (NnUint)readU32(network, ROOT_SOCKET_INDEX);
 
         if (segmentConfig->nSyncs > 0) {
             segmentConfig->syncs = new NnSyncConfig[segmentConfig->nSyncs];
 
             for (NnUint syncIndex = 0; syncIndex < segmentConfig->nSyncs; syncIndex++) {
                 NnSyncConfig *syncConfig = &segmentConfig->syncs[syncIndex];
-                network->read(ROOT_SOCKET_INDEX, &syncConfig->pipeIndex, sizeof(syncConfig->pipeIndex));
-                network->read(ROOT_SOCKET_INDEX, &syncConfig->syncType, sizeof(syncConfig->syncType));
+                syncConfig->pipeIndex = (NnUint)readU32(network, ROOT_SOCKET_INDEX);
+                syncConfig->syncType = (NnSyncType)readI32(network, ROOT_SOCKET_INDEX);
             }
         }
 
@@ -1515,16 +1600,18 @@ NnNodeConfig NnWorkerConfigReader::readNode() {
 
             for (NnUint opIndex = 0; opIndex < segmentConfig->nOps; opIndex++) {
                 NnOpConfig *opConfig = &segmentConfig->ops[opIndex];
-                network->read(ROOT_SOCKET_INDEX, &opConfig->code, sizeof(opConfig->code));
-                network->read(ROOT_SOCKET_INDEX, &opConfig->index, sizeof(opConfig->index));
-                network->read(ROOT_SOCKET_INDEX, &opConfig->weightSize, sizeof(opConfig->weightSize));
-                network->read(ROOT_SOCKET_INDEX, &opConfig->configSize, sizeof(opConfig->configSize));
+                opConfig->code = (NnOpCode)readI32(network, ROOT_SOCKET_INDEX);
+                opConfig->index = (NnUint)readU32(network, ROOT_SOCKET_INDEX);
+                opConfig->weightSize = readSize3DWire(network, ROOT_SOCKET_INDEX);
+                opConfig->configSize = (NnUint)readU32(network, ROOT_SOCKET_INDEX);
                 opConfig->name = readString(network, ROOT_SOCKET_INDEX);
-                network->read(ROOT_SOCKET_INDEX, &opConfig->input, sizeof(opConfig->input));
-                network->read(ROOT_SOCKET_INDEX, &opConfig->output, sizeof(opConfig->output));
+                opConfig->input = readPointerConfig(network, ROOT_SOCKET_INDEX);
+                opConfig->output = readPointerConfig(network, ROOT_SOCKET_INDEX);
                 if (opConfig->configSize > 0) {
                     opConfig->config = new NnByte[opConfig->configSize];
                     network->read(ROOT_SOCKET_INDEX, opConfig->config, opConfig->configSize);
+                } else {
+                    opConfig->config = nullptr;
                 }
             }
         }

@@ -50,7 +50,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.seed = (unsigned long long)time(nullptr);
     args.chatTemplateType = TEMPLATE_UNKNOWN;
     args.maxSeqLen = 0;
-    args.netTurbo = true;
+    args.netTurbo = false;
     args.gpuIndex = -1;
     args.gpuSegmentFrom = -1;
     args.gpuSegmentTo = -1;
