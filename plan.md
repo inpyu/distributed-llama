@@ -323,9 +323,93 @@ LLM decode는 “토큰당 forward 1회”이므로, 이 오버헤드는 토큰 
 
 주의: 라즈베리파이 환경/네트워크 품질에 따라 목표치는 조정될 수 있으나, 반드시 “동기화/네트워크 stage의 감소”로 설명 가능해야 한다.
 
+### Phase 2.5 (Week 4~5): Collective 알고리즘 개선 (PP 도입 전 필수)
+
+**상태**: Phase 1 완료 후 진행 예정
+
+**목표**: PP 도입 전에 collective 알고리즘을 개선하여 모든 구성에서 이득을 얻음
+
+**배경**: PP를 도입하기 전에 collective 알고리즘을 개선하면:
+- TP-only 모드에서도 즉시 성능 개선
+- PP 도입 후에도 각 TP 그룹 내에서 개선된 collective 사용
+- 구현 복잡도가 PP보다 낮음
+
+---
+
+#### 2.5.1 현재 Collective 구현 분석
+
+**Star All-Reduce (현재 기본값)**:
+- Root가 모든 worker로부터 데이터 수집 후 reduce, 다시 broadcast
+- 장점: 구현 단순, 소규모에서 효율적
+- 단점: Root가 병목, 노드 수 증가 시 확장성 저하
+
+**Ring All-Reduce (이미 구현됨, 미사용)**:
+- `syncNodeSlices_ringAllReduce()` in `nn-network.cpp`
+- 각 노드가 이웃과만 통신, 전체 2(n-1) 단계
+- 장점: 대역폭 최적, 노드 수 증가에 강함
+- 현재: `--collective ring`으로 활성화 가능하나 기본값 아님
+
+---
+
+#### 2.5.2 개선 작업
+
+**작업 1: Collective 자동 선택 로직 개선**
+
+현재 `COLLECTIVE_AUTO` 로직:
+```cpp
+// nn-network.cpp:1315
+if (effective == COLLECTIVE_AUTO) {
+    effective = nNodes <= 4 ? COLLECTIVE_STAR : COLLECTIVE_RING;
+}
+```
+
+개선안:
+- 4노드 이하: Star 유지
+- 5노드 이상: Ring 사용
+- 추가 고려: 메시지 크기에 따른 동적 선택
+
+**작업 2: Hierarchical All-Reduce 추가 (선택적)**
+
+8+ 노드에서 더 효율적인 계층적 reduce:
+- 2-level: 4노드씩 그룹 내 reduce → 그룹 대표 간 reduce → broadcast
+- PP 도입 시 자연스럽게 TP 그룹 간 계층 구조와 호환
+
+**작업 3: Ring All-Reduce 안정화**
+
+현재 Ring 구현 검증:
+- Deadlock 가능성 검사 (even/odd 순서 교차)
+- 대용량 메시지 처리 테스트
+- 성능 프로파일링
+
+---
+
+#### 2.5.3 예상 효과
+
+| 구성 | Star (현재) | Ring (개선) | 예상 개선율 |
+|------|------------|-------------|------------|
+| 4노드 | 기준 | 비슷 | 0-5% |
+| 8노드 | 병목 심각 | 대역폭 분산 | 20-40% |
+| 16노드 | 매우 느림 | 확장성 유지 | 40%+ |
+
+---
+
+#### 2.5.4 완료 기준
+
+- [ ] `--collective auto`가 노드 수에 따라 적절히 Star/Ring 선택
+- [ ] Ring All-Reduce 8노드 테스트 통과
+- [ ] 8노드에서 TTFT가 Star 대비 20% 이상 개선 (또는 동등)
+
+---
+
+
 ### Phase 3 (Week 5~7): “TP 무릎 고정 + Replica 스케일” 운영 구조 도입
 
 목표: 처리량 확장은 TP degree 증가가 아니라, “그룹 복제 + 라우팅”으로 해결.
+
+**PP와의 관계 명확화**:
+- **PP**: 단일 요청의 TTFT를 유지하면서 더 많은 노드 활용 (TP 그룹 크기 제한)
+- **DP/Replica**: 여러 요청을 동시에 처리하여 처리량 증가 (단일 요청 TTFT에는 영향 없음)
+- **권장 조합**: PP=2 x TP=4를 하나의 "replica unit"으로, 이를 복제하여 확장
 
 핵심 작업(2가지 옵션 중 택1 또는 병행):
 
@@ -366,82 +450,226 @@ LLM decode는 “토큰당 forward 1회”이므로, 이 오버헤드는 토큰 
   - 단일 요청 TTFT p95는 4노드 TP와 유사
   - 동일 TTFT 목표를 유지하면서 처리 가능한 동시 요청 수(throughput)가 증가
 
-### Phase 4 (Week 7~10): PP/CP 도입 스파이크(근거 기반, PP 우선)
+### Phase 4 (Week 7~10): PP(Pipeline Parallelism) 구현
 
-현실 인식(중요): 현재 구조는 TP-by-dimension이며 레이어마다 동기화가 박혀 있다(`distributed-llama/NODE_DISTRIBUTION_GUIDE.md`). PP/CP를 “제대로” 넣는 것은 **거의 새 엔진 수준**의 변경이다.
+**상태 업데이트 (2024)**: Phase 1(스레드 병목)이 해결되었으므로, 이제 PP를 통해 더 많은 노드를 효과적으로 활용할 수 있다.
 
-그럼에도 vLLM/TensorRT-LLM이 PP/CP를 권장하는 이유(=TP-only 한계)를 반영해, Phase 4에서는 “가능한 최소 리스크”로 PP/CP를 **스파이크**하고, 수치로 go/no-go를 결정한다.
+**핵심 목표**: TP 무릎(<=4)을 유지하면서 더 많은 노드를 활용하여 TTFT 악화 없이 확장
 
-따라서 Phase 4는 아래 조건을 만족할 때만 진행한다.
+---
 
-- Phase 1~3을 했는데도 TTFT 목표를 달성하지 못함
-- 또는 특정 모델이 메모리/성능 요구로 인해 PP 없이는 운영이 불가능
+#### 4.1 PP 도입 배경과 기대 효과
 
-#### Gate 0: TP 무릎 원인 확정
+**현재 TP-only의 한계**:
+- TP=8에서 per-layer all-reduce 오버헤드가 TTFT를 지배
+- 관측된 데이터: 4노드→8노드에서 TTFT가 ~16s→~38s로 2.4배 악화
 
-- TP=1/2/4/8에서 `compute vs SYNC_NODE_SLICES` 비중과 TTFT p95를 비교
-- 8에서 sync가 TTFT를 지배(또는 superlinear)하는 것이 확인되면 PP 스파이크 진행
+**PP 도입 시 예상 개선**:
+- TP 그룹 크기를 4로 유지 → per-layer sync 오버헤드 감소
+- PP stage boundary에서만 activation 전송 추가
+- **핵심 가정**: "모든 레이어에서 절약된 all-reduce 시간" > "(stage boundary 전송 시간) + (파이프라인 버블)"
 
-#### Gate 1: 스레드 모델/분산 변수 제거
+---
 
-- Phase 1(스레드 모델 리팩토링)으로 forward-time 분산을 낮춘 뒤에만 PP/CP를 평가
+#### 4.2 Topology Abstraction 설계
 
-#### PP 스파이크(권장 1순위)
+기존 "global TP world"를 아래 구조로 대체:
 
-Oracle 권장(요약): CPU-only Ethernet에서는 PP가 “가치가 있을 수 있는 유일한 추가 축”이지만, 단일 요청 TTFT를 마법처럼 줄이는 것이 아니라 **TP를 무릎(<=4)로 고정하면서도 더 많은 노드를 활용**하기 위한 수단으로 봐야 한다.
+```
+ParallelTopology {
+    pp_size: NnUint,      // Pipeline Parallelism degree (default: 1)
+    tp_size: NnUint,      // Tensor Parallelism degree per stage (default: nNodes)
+    pp_rank: NnUint,      // My pipeline stage index
+    tp_rank: NnUint,      // My rank within TP group
+    
+    // 예: 8노드, PP=2, TP=4
+    // Stage 0: 노드 0,1,2,3 (tp_rank 0,1,2,3)
+    // Stage 1: 노드 4,5,6,7 (tp_rank 0,1,2,3)
+}
+```
 
-권장 초기 구성:
+**Slice-Preserving 원칙** (핵심):
+- Stage boundary에서 rank i → rank i로 전송 (rank 0→0, rank 1→1, ...)
+- 이유: hidden state가 이미 TP로 슬라이스되어 있으므로, 리셔플/all-gather 없이 그대로 전달
+- 구현: 각 TP rank가 자신의 슬라이스만 다음 stage의 같은 rank에 전송
 
-- 8노드라면 `PP=2 x TP=4`부터 시작(=stage boundary 최소화)
-- `PP=4 x TP=2`는 stage boundary가 늘어 TTFT에 불리할 확률이 높으므로 후순위
+---
 
-가장 단순한 PP 설계(least-risk):
+#### 4.3 레이어 분할 전략
 
-- 레이어를 연속 구간으로 2등분(앞 절반/뒤 절반)
-- Stage 0: embedding + 초기 N layers
-- Stage 1: 나머지 layers + final norm/lm-head
-- stage 간에는 hidden state(activation)만 전달
+**권장 초기 구성**: PP=2 x TP=4 (8노드 기준)
 
-스케줄링 원칙:
+```
+Stage 0 (노드 0-3):
+  - Embedding layer
+  - Layers [0, k) where k = nLayers / 2
+  - 각 layer의 attention + FFN 블록
 
-- decode: TTFT 단독 개선이 목적이 아니라, 동시 요청 배칭으로 throughput을 올리면서 TTFT 예산 내 유지
-- prefill: 긴 프롬프트에서만 token-chunk microbatch(예: 16~64 tokens)를 시도하되, chunk가 너무 작아지면 TTFT가 증가할 수 있으므로 측정 기반으로만 적용
+Stage 1 (노드 4-7):
+  - Layers [k, nLayers)
+  - Final RMS Norm
+  - LM Head (logits 계산)
+```
 
-측정/합격 기준(예시):
+**분할 지점 선택 기준**:
+- FLOPs 균형: attention과 FFN의 compute를 고려해 stage 간 균형 유지
+- 레이어 경계에서만 분할 (attention 중간이나 FFN 중간에서 분할하지 않음)
+- KV cache는 각 stage가 자신의 레이어에 대해서만 유지
 
-- 비교군: `TP=8` vs `PP=2 x TP=4` (동일 모델/동일 프롬프트/동일 동시성)
-- 보고 지표:
-  - TTFT p50/p95
-  - steady tokens/s
-  - `SYNC_NODE_SLICES` 시간 vs stage 전송 시간
-  - bytes/token, CPU idle(wait) 비중
-- stop condition:
-  - `PP=2 x TP=4`가 throughput 이득이 없고, TTFT p95가 허용 예산(예: 1.3x) 이상 악화되면 즉시 중단
+---
 
-#### CP 스파이크(조건부, 2순위)
+#### 4.4 Stage Boundary 통신 프로토콜
 
-TensorRT-LLM은 CP를 “롱 컨텍스트”에 적합하다고 명시한다(`TensorRT-LLM/docs/source/features/parallel-strategy.md`).
+**프로토콜 설계**:
 
-CPU-only에서 CP는 아래 조건을 만족할 때만 진행:
+```cpp
+struct StageActivationHeader {
+    NnUint seq_start;       // 시퀀스 시작 위치
+    NnUint seq_len;         // 이 청크의 토큰 수
+    NnUint slice_id;        // TP slice index (0..tp_size-1)
+    NnFloatType dtype;      // F_32, F_16, Q80 등
+    NnSize payload_bytes;   // 실제 데이터 크기
+};
+```
 
-- 워크로드의 대부분이 장문 프롬프트이고, TTFT의 지배 항이 prefill
-- 그리고 PP/DP만으로는 TTFT/throughput 목표를 달성하지 못함
+**통신 패턴**:
+1. Stage 0이 layer [0,k)를 처리
+2. Stage 0의 각 TP rank가 hidden state slice를 Stage 1의 같은 rank에 전송
+3. Stage 1이 layer [k,L)을 처리하고 logits 계산
 
-그 외에는 CP 대신 아래 CP-like를 우선:
+**Prefill 스트리밍** (긴 프롬프트 처리):
+- 전체 프롬프트를 한번에 보내지 않고 청크(예: 64 tokens)로 분할
+- Stage 0이 청크 N을 처리하는 동안 Stage 1은 청크 N-1을 처리
+- 파이프라인 parallelism으로 latency hiding
 
-- prefill/decode 스케줄링 분리(동일 엔진 내에서 우선순위로 간섭 최소화)
-- prefill chunking 정책(=vLLM의 chunked prefill 아이디어를 “CPU 스케줄러”로 번역)
-  - vLLM은 `max_num_batched_tokens` 튜닝으로 TTFT/ITL 트레이드오프를 설명(`vllm/docs/configuration/optimization.md`).
+---
 
-연구 항목(원형):
+#### 4.5 구현 단계별 계획
 
-- PP(레이어 분할) 설계: 레이어 stage 간 activation send/recv 프로토콜, 파이프라인 버블/스케줄링
-- CP(컨텍스트 축 분할) 설계: prefill에서만 sequence shard 적용 가능성 검토
+**Step 1: Topology 추상화 (예상 1-2일)**
 
-완료 기준:
+```cpp
+// nn-topology.hpp (새 파일)
+struct NnParallelTopology {
+    NnUint pp_size;
+    NnUint tp_size;
+    NnUint pp_rank;
+    NnUint tp_rank;
+    NnUint global_rank;
+    
+    static NnParallelTopology createTPOnly(NnUint nNodes, NnUint nodeIndex);
+    static NnParallelTopology createPPxTP(NnUint pp_size, NnUint tp_size, NnUint nodeIndex);
+    
+    NnUint getTPPeerNodeIndex(NnUint peer_tp_rank) const;
+    NnUint getPPPeerNodeIndex() const; // 다음/이전 stage의 같은 tp_rank
+};
+```
 
-- “CPU-only 이더넷 환경에서도” 통신량/동기화 빈도 감소가 실제로 이득인지 수치로 입증
-- 입증 실패 시: 기능 구현을 중단하고 Phase 2/3의 최적화에 집중
+**Step 2: TP 그룹 독립화 (예상 2-3일)**
+
+- `NnNetworkNodeSynchronizer`를 TP 그룹 범위로 제한
+- 기존 all-reduce가 전체 노드가 아닌 TP 그룹 내에서만 동작하도록 수정
+- CLI 옵션 추가: `--pp-size <n>` (default: 1 = 현재 동작 유지)
+
+**Step 3: Stage Boundary 통신 (예상 3-4일)**
+
+```cpp
+// nn-pipeline.hpp (새 파일)
+class NnPipelineBoundary {
+public:
+    NnPipelineBoundary(NnNetwork *network, NnParallelTopology *topology);
+    
+    void sendActivation(NnByte *hidden_state, NnSize slice_bytes, StageActivationHeader header);
+    void recvActivation(NnByte *hidden_state, NnSize slice_bytes, StageActivationHeader *header);
+    
+    // Prefill streaming
+    void sendChunk(NnByte *data, NnUint chunk_tokens, NnUint total_tokens);
+    bool recvChunk(NnByte *data, NnUint *chunk_tokens, NnUint *total_tokens);
+};
+```
+
+**Step 4: LLM 그래프 분할 (예상 2-3일)**
+
+- `buildLlmNet()` 수정: pp_rank에 따라 레이어 범위 결정
+- Stage 0: embedding 포함, 마지막에 activation send
+- Stage 1: activation recv로 시작, logits 계산
+
+**Step 5: 스케줄링 및 동기화 (예상 2-3일)**
+
+- Decode (단일 토큰): 단순 순차 처리
+- Prefill (긴 프롬프트): 청크 기반 파이프라이닝
+- Batch 처리: 여러 요청의 decode를 파이프라인으로 겹침
+
+---
+
+#### 4.6 성능 측정 및 검증
+
+**A/B 테스트 구성**:
+- 대조군: TP=8 (현재 방식)
+- 실험군: PP=2 x TP=4
+
+**측정 지표**:
+| 지표 | 측정 방법 |
+|------|----------|
+| TTFT p50/p95 | prefill 완료 시점 - 요청 시작 시점 |
+| All-reduce 시간 | `executor.getTotalTime(STEP_SYNC_NODES)` |
+| Stage 전송 시간 | `StageActivationHeader` 타임스탬프 |
+| 파이프라인 버블 | idle time 측정 |
+| 처리량 | tokens/s (동시 요청 시) |
+
+**합격 기준**:
+- TTFT p95: PP=2xTP=4가 TP=8보다 개선 (또는 최소한 동등)
+- 처리량: 동시 요청 시 TP=8 대비 향상
+- 안정성: 1000회 요청 연속 처리 시 오류 없음
+
+**실패 시 중단 기준**:
+- PP=2xTP=4의 TTFT p95가 TP=4 단독보다 1.3배 이상 악화
+- Stage boundary 전송이 병목이 되어 all-reduce 절감분을 상쇄
+
+---
+
+#### 4.7 CP(Context Parallelism) 결정
+
+**결론: CP는 현재 단계에서 구현하지 않음**
+
+**이유**:
+1. <4K 토큰 프롬프트에서는 CP 오버헤드가 이점을 상쇄
+2. CPU+1GbE 환경에서 sequence shard 간 통신이 빈번하고 비용이 높음
+3. PP+DP로 대부분의 확장 목표 달성 가능
+
+**대안 (CP-like 기능)**:
+- Prefill chunking: 긴 프롬프트를 청크로 나누어 파이프라인 처리
+- Prefill/Decode 분리: 동일 엔진 내에서 prefill과 decode의 스케줄링 우선순위 조정
+
+**CP 재검토 조건**:
+- 워크로드의 대부분이 8K+ 토큰 프롬프트
+- Prefill이 TTFT의 80% 이상을 차지
+- PP+DP로 목표 달성 불가
+
+---
+
+#### 4.8 리스크 및 완화 전략
+
+| 리스크 | 설명 | 완화 전략 |
+|--------|------|----------|
+| Prefill 대역폭 병목 | 긴 프롬프트의 activation 전송이 1GbE를 포화시킴 | 청크 스트리밍, dtype 압축 (fp16) |
+| 데드락 | PP boundary send/recv와 TP barrier 간 경합 | 명시적 청크 시퀀싱, 타임아웃 |
+| Stage 불균형 | FLOPs 불균형으로 한 stage가 병목 | 프로파일러 기반 분할점 조정 |
+| 기존 모드 호환성 | TP-only 모드가 깨짐 | PP=1을 기본값으로, 철저한 회귀 테스트 |
+
+---
+
+#### 4.9 예상 일정 및 마일스톤
+
+| 마일스톤 | 예상 기간 | 산출물 |
+|----------|----------|--------|
+| M1: Topology 추상화 | 1-2일 | `nn-topology.hpp/cpp` |
+| M2: TP 그룹 독립화 | 2-3일 | 수정된 `nn-network.cpp` |
+| M3: Stage Boundary 통신 | 3-4일 | `nn-pipeline.hpp/cpp` |
+| M4: LLM 그래프 분할 | 2-3일 | 수정된 `llm.cpp` |
+| M5: 스케줄링 | 2-3일 | Prefill 청킹 구현 |
+| M6: 벤치마크 및 튜닝 | 2-3일 | 성능 보고서 |
+| **총계** | **12-18일** | PP=2xTP=4 운영 가능 |
 
 ---
 
@@ -523,10 +751,26 @@ CPU-only에서 CP는 아래 조건을 만족할 때만 진행:
 
 ## 8. 즉시 실행 우선순위(요약)
 
-1) Phase 0: TTFT 분해 측정부터 고정
-2) Phase 1: `NnExecutor::forward()` 스레드 모델을 persistent로 바꿔 thread overhead를 먼저 잡기
-3) Phase 2: `SYNC_NODE_SLICES`의 루트 단일 스레드/루트 병목을 제거(또는 ring 옵션 도입)
-4) Phase 3: “4노드 그룹 고정 + Replica 라우팅”으로 throughput을 스케일
+**현재 상태**: Phase 1(스레드 병목) 완료
+
+**다음 단계 우선순위**:
+
+1) ~~Phase 0: TTFT 분해 측정부터 고정~~ ✅
+2) ~~Phase 1: `NnExecutor::forward()` 스레드 모델을 persistent로 바꿔 thread overhead를 먼저 잡기~~ ✅
+3) **Phase 2**: `SYNC_NODE_SLICES`의 루트 단일 스레드/루트 병목을 제거(또는 ring 옵션 도입)
+4) **Phase 2.5**: Collective 알고리즘 개선 (Ring All-Reduce 기본값 전환, 8노드 안정화)
+5) **Phase 4**: PP(Pipeline Parallelism) 구현 - TP 그룹 분리 + Stage Boundary 통신
+6) Phase 3: "4노드 그룹 고정 + Replica 라우팅"으로 throughput을 스케일 (PP와 병행 또는 후속)
+
+**권장 실행 순서**:
+```
+Collective 개선 (Phase 2/2.5) → PP 구현 (Phase 4) → DP/Replica (Phase 3)
+```
+
+**이유**:
+- Collective 개선: PP 없이도 모든 구성에서 즉시 효과, 낮은 구현 복잡도
+- PP 구현: 8노드에서 TP=8 대신 PP=2xTP=4로 TTFT 유지하면서 확장
+- DP/Replica: PP 완료 후 처리량 확장이 필요할 때 추가
 
 ---
 
