@@ -20,12 +20,45 @@ typedef SSIZE_T ssize_t;
 #include <iomanip>
 #include <algorithm>
 #include <map>
+#include <chrono>
+#include <thread>
+#include <cstdlib>
 
 #define SOCKET_LAST_ERRCODE errno
 #define SOCKET_LAST_ERROR strerror(errno)
 
 #define ACK 23571114
 #define MAX_CHUNK_SIZE 4096
+
+#define DEFAULT_NET_STALL_LOG_MS 2000ul
+#define DEFAULT_NET_STALL_TIMEOUT_MS 8000ul
+
+static unsigned long readTimeoutEnvMs(const char *name, unsigned long fallbackMs) {
+    const char *value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0')
+        return fallbackMs;
+
+    char *endPtr = nullptr;
+    unsigned long parsed = std::strtoul(value, &endPtr, 10);
+    if (endPtr == nullptr || *endPtr != '\0' || parsed == 0)
+        return fallbackMs;
+    return parsed;
+}
+
+static inline unsigned long getNetStallLogMs() {
+    static const unsigned long value = readTimeoutEnvMs("DLLAMA_NET_STALL_LOG_MS", DEFAULT_NET_STALL_LOG_MS);
+    return value;
+}
+
+static inline unsigned long getNetStallTimeoutMs() {
+    static const unsigned long raw = readTimeoutEnvMs("DLLAMA_NET_STALL_TIMEOUT_MS", DEFAULT_NET_STALL_TIMEOUT_MS);
+    static const unsigned long minimum = getNetStallLogMs();
+    return raw < minimum ? minimum : raw;
+}
+
+static inline void sleepOnSocketRetry() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+}
 
 static inline bool isEagainError() {
     #ifdef _WIN32
@@ -86,10 +119,39 @@ void setReuseAddr(int socket) {
 }
 
 void writeSocket(int socket, const void *data, NnSize size) {
+    auto lastProgressTime = std::chrono::steady_clock::now();
+    auto lastLogTime = lastProgressTime;
+    const unsigned long logTimeoutMs = getNetStallLogMs();
+    const unsigned long hardTimeoutMs = getNetStallTimeoutMs();
+
     while (size > 0) {
         ssize_t s = send(socket, (const char*)data, size, 0);
         if (s < 0) {
             if (isEagainError()) {
+                auto now = std::chrono::steady_clock::now();
+                long long stallMs = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(now - lastProgressTime).count();
+                long long sinceLogMs = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(now - lastLogTime).count();
+
+                if ((unsigned long)stallMs >= hardTimeoutMs) {
+                    printf("🚨 [NET_TIMEOUT] writeSocket fd=%d stalled=%lldms pending=%zuB (timeout=%lums)\n",
+                        socket,
+                        stallMs,
+                        (size_t)size,
+                        hardTimeoutMs);
+                    fflush(stdout);
+                    throw NnTransferSocketException(SOCKET_LAST_ERRCODE,
+                        "writeSocket timeout after " + std::to_string(stallMs) + "ms");
+                }
+
+                if ((unsigned long)stallMs >= logTimeoutMs && (unsigned long)sinceLogMs >= logTimeoutMs) {
+                    printf("⏳ [NET_STALL] writeSocket fd=%d stalled=%lldms pending=%zuB\n",
+                        socket,
+                        stallMs,
+                        (size_t)size);
+                    fflush(stdout);
+                    lastLogTime = now;
+                }
+                sleepOnSocketRetry();
                 continue;
             }
             throw NnTransferSocketException(0, "Error writing to socket");
@@ -98,22 +160,53 @@ void writeSocket(int socket, const void *data, NnSize size) {
         }
         size -= s;
         data = (const char*)data + s;
+        lastProgressTime = std::chrono::steady_clock::now();
     }
 }
 
 static inline bool tryReadSocket(int socket, void *data, NnSize size, unsigned long maxAttempts) {
     // maxAttempts = 0 means infinite attempts
+    auto lastProgressTime = std::chrono::steady_clock::now();
+    auto lastLogTime = lastProgressTime;
+    const unsigned long logTimeoutMs = getNetStallLogMs();
+    const unsigned long hardTimeoutMs = getNetStallTimeoutMs();
+
     NnSize s = size;
     while (s > 0) {
         ssize_t r = recv(socket, (char*)data, s, 0);
         if (r < 0) {
             if (isEagainError()) {
+                auto now = std::chrono::steady_clock::now();
+                long long stallMs = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(now - lastProgressTime).count();
+                long long sinceLogMs = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(now - lastLogTime).count();
+
                 if (s == size && maxAttempts > 0) {
                     maxAttempts--;
                     if (maxAttempts == 0) {
                         return false;
                     }
                 }
+
+                if ((unsigned long)stallMs >= hardTimeoutMs) {
+                    printf("🚨 [NET_TIMEOUT] tryReadSocket fd=%d stalled=%lldms pending=%zuB (timeout=%lums)\n",
+                        socket,
+                        stallMs,
+                        (size_t)s,
+                        hardTimeoutMs);
+                    fflush(stdout);
+                    throw NnTransferSocketException(SOCKET_LAST_ERRCODE,
+                        "tryReadSocket timeout after " + std::to_string(stallMs) + "ms");
+                }
+
+                if ((unsigned long)stallMs >= logTimeoutMs && (unsigned long)sinceLogMs >= logTimeoutMs) {
+                    printf("⏳ [NET_STALL] tryReadSocket fd=%d stalled=%lldms pending=%zuB\n",
+                        socket,
+                        stallMs,
+                        (size_t)s);
+                    fflush(stdout);
+                    lastLogTime = now;
+                }
+                sleepOnSocketRetry();
                 continue;
             }
             throw NnTransferSocketException(0, "Error reading from socket");
@@ -122,6 +215,7 @@ static inline bool tryReadSocket(int socket, void *data, NnSize size, unsigned l
         }
         data = (char*)data + r;
         s -= r;
+        lastProgressTime = std::chrono::steady_clock::now();
     }
     return true;
 }
@@ -462,7 +556,11 @@ bool NnNetwork::tryReadWithMaxAttempts(NnUint socketIndex, void *data, NnSize si
 
 void NnNetwork::writeMany(NnUint n, NnSocketIo *ios) {
     bool isWriting;
-    NnSize nBytes = 0;
+    auto lastProgressTime = std::chrono::steady_clock::now();
+    auto lastLogTime = lastProgressTime;
+    const unsigned long logTimeoutMs = getNetStallLogMs();
+    const unsigned long hardTimeoutMs = getNetStallTimeoutMs();
+
     for (NnUint i = 0; i < n; i++) {
         NnSocketIo *io = &ios[i];
         assert(io->socketIndex < nSockets);
@@ -470,10 +568,13 @@ void NnNetwork::writeMany(NnUint n, NnSocketIo *ios) {
     }
     do {
         isWriting = false;
+        bool hasProgress = false;
+        NnSize pendingBytes = 0;
         for (NnUint i = 0; i < n; i++) {
             NnSocketIo *io = &ios[i];
             if (io->size > 0) {
                 isWriting = true;
+                pendingBytes += io->size;
                 int socket = sockets[io->socketIndex];
                 ssize_t chunkSize = io->size > MAX_CHUNK_SIZE ? MAX_CHUNK_SIZE : io->size;
                 ssize_t s = send(socket, (const char*)io->data, chunkSize, 0);
@@ -487,7 +588,37 @@ void NnNetwork::writeMany(NnUint n, NnSocketIo *ios) {
                 }
                 io->size -= s;
                 io->data = (char*)io->data + s;
+                hasProgress = true;
             }
+        }
+
+        if (isWriting && !hasProgress) {
+            auto now = std::chrono::steady_clock::now();
+            long long stallMs = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(now - lastProgressTime).count();
+            long long sinceLogMs = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(now - lastLogTime).count();
+
+            if ((unsigned long)stallMs >= hardTimeoutMs) {
+                printf("🚨 [NET_TIMEOUT] writeMany stalled=%lldms pending=%zuB sockets=%u (timeout=%lums)\n",
+                    stallMs,
+                    (size_t)pendingBytes,
+                    n,
+                    hardTimeoutMs);
+                fflush(stdout);
+                throw NnTransferSocketException(SOCKET_LAST_ERRCODE,
+                    "writeMany timeout after " + std::to_string(stallMs) + "ms");
+            }
+
+            if ((unsigned long)stallMs >= logTimeoutMs && (unsigned long)sinceLogMs >= logTimeoutMs) {
+                printf("⏳ [NET_STALL] writeMany stalled=%lldms pending=%zuB sockets=%u\n",
+                    stallMs,
+                    (size_t)pendingBytes,
+                    n);
+                fflush(stdout);
+                lastLogTime = now;
+            }
+            sleepOnSocketRetry();
+        } else if (hasProgress) {
+            lastProgressTime = std::chrono::steady_clock::now();
         }
     } while (isWriting);
 }
@@ -505,6 +636,10 @@ void NnNetwork::writeAll(void *data, NnSize size) {
 
 void NnNetwork::readMany(NnUint n, NnSocketIo *ios) {
     auto startTime = std::chrono::high_resolution_clock::now();
+    auto lastProgressTime = std::chrono::steady_clock::now();
+    auto lastLogTime = lastProgressTime;
+    const unsigned long logTimeoutMs = getNetStallLogMs();
+    const unsigned long hardTimeoutMs = getNetStallTimeoutMs();
     
     bool isReading;
     NnSize nBytes = 0;
@@ -516,10 +651,13 @@ void NnNetwork::readMany(NnUint n, NnSocketIo *ios) {
     }
     do {
         isReading = false;
+        bool hasProgress = false;
+        NnSize pendingBytes = 0;
         for (NnUint i = 0; i < n; i++) {
             NnSocketIo *io = &ios[i];
             if (io->size > 0) {
                 isReading = true;
+                pendingBytes += io->size;
                 int socket = sockets[io->socketIndex];
                 ssize_t r = recv(socket, (char*)io->data, io->size, 0);
                 if (r < 0) {
@@ -532,7 +670,37 @@ void NnNetwork::readMany(NnUint n, NnSocketIo *ios) {
                 }
                 io->size -= r;
                 io->data = (char*)io->data + r;
+                hasProgress = true;
             }
+        }
+
+        if (isReading && !hasProgress) {
+            auto now = std::chrono::steady_clock::now();
+            long long stallMs = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(now - lastProgressTime).count();
+            long long sinceLogMs = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(now - lastLogTime).count();
+
+            if ((unsigned long)stallMs >= hardTimeoutMs) {
+                printf("🚨 [NET_TIMEOUT] readMany stalled=%lldms pending=%zuB sockets=%u (timeout=%lums)\n",
+                    stallMs,
+                    (size_t)pendingBytes,
+                    n,
+                    hardTimeoutMs);
+                fflush(stdout);
+                throw NnTransferSocketException(SOCKET_LAST_ERRCODE,
+                    "readMany timeout after " + std::to_string(stallMs) + "ms");
+            }
+
+            if ((unsigned long)stallMs >= logTimeoutMs && (unsigned long)sinceLogMs >= logTimeoutMs) {
+                printf("⏳ [NET_STALL] readMany stalled=%lldms pending=%zuB sockets=%u\n",
+                    stallMs,
+                    (size_t)pendingBytes,
+                    n);
+                fflush(stdout);
+                lastLogTime = now;
+            }
+            sleepOnSocketRetry();
+        } else if (hasProgress) {
+            lastProgressTime = std::chrono::steady_clock::now();
         }
     } while (isReading);
     
