@@ -21,6 +21,13 @@ static ChatTemplateType parseChatTemplateType(char *val) {
     throw std::runtime_error("Invalid chat template type: " + std::string(val));
 }
 
+static CollectiveType parseCollectiveType(char *val) {
+    if (std::strcmp(val, "auto") == 0) return COLLECTIVE_AUTO;
+    if (std::strcmp(val, "star") == 0) return COLLECTIVE_STAR;
+    if (std::strcmp(val, "ring") == 0) return COLLECTIVE_RING;
+    throw std::runtime_error("Invalid collective type: " + std::string(val) + " (expected: auto, star, ring)");
+}
+
 AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     AppCliArgs args;
     args.info = true;
@@ -43,6 +50,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.chatTemplateType = TEMPLATE_UNKNOWN;
     args.maxSeqLen = 0;
     args.netTurbo = true;
+    args.collectiveType = COLLECTIVE_AUTO;
     args.gpuIndex = -1;
     args.gpuSegmentFrom = -1;
     args.gpuSegmentTo = -1;
@@ -121,6 +129,8 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             args.gpuSegmentTo = atoi(separator + 1);
         } else if (std::strcmp(name, "--net-turbo") == 0) {
             args.netTurbo = atoi(value) == 1;
+        } else if (std::strcmp(name, "--collective") == 0) {
+            args.collectiveType = parseCollectiveType(value);
         } else {
             throw std::runtime_error("Unknown option: " + std::string(name));
         }
@@ -264,7 +274,7 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     } else {
         networkPtr = NnNetwork::connect(args->nWorkers, args->workerHosts, args->workerPorts);
         network = networkPtr.get();
-        synchronizer.reset(new NnNetworkNodeSynchronizer(network, &execution, &net.netConfig, rootNodeConfig));
+        synchronizer.reset(new NnNetworkNodeSynchronizer(network, &execution, &net.netConfig, rootNodeConfig, args->collectiveType));
 
         NnRootConfigWriter configWriter(network);
         configWriter.writeToWorkers(&net.netConfig, net.nodeConfigs);
@@ -284,10 +294,13 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
             network->setTurbo(true);
             printf("🚁 Network is in non-blocking mode\n");
         }
-        
-        // Enable network performance monitoring for bottleneck analysis
+
+        const char *collectiveName = "auto";
+        if (args->collectiveType == COLLECTIVE_STAR) collectiveName = "star";
+        else if (args->collectiveType == COLLECTIVE_RING) collectiveName = "ring";
+        printf("📡 Collective: %s (nNodes=%d)\n", collectiveName, nNodes);
+
         network->enablePerformanceMonitoring(true);
-        printf("📊 Network performance monitoring enabled for bottleneck analysis\n");
     }
 
     AppInferenceContext context;
@@ -326,7 +339,7 @@ void runWorkerApp(AppCliArgs *args) {
         NnNetExecution execution(args->nThreads, &netConfig);
 
         std::vector<NnExecutorDevice> devices = resolveDevices(args, &netConfig, &nodeConfig, &execution);
-        NnNetworkNodeSynchronizer synchronizer(network, &execution, &netConfig, &nodeConfig);
+        NnNetworkNodeSynchronizer synchronizer(network, &execution, &netConfig, &nodeConfig, args->collectiveType);
         NnExecutor executor(&netConfig, &nodeConfig, &devices, &execution, &synchronizer, false);
 
         NnWorkerWeightReader weightReader(&executor, network);

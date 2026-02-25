@@ -959,14 +959,6 @@ static void syncNodeSlices_alltoall(bool onlyFromWorkerToRoot, NnNetwork *networ
     }
 }
 
-// ============================================================================
-// O(log n) Binary Tree Gather-Broadcast Implementation
-// This is a fundamental redesign that reduces complexity from O(n^2) to O(log n)
-// Architecture: Gather to Root → (Optional Compute) → Broadcast from Root
-// ============================================================================
-
-// Helper to get socket index in full mesh topology
-// Socket mapping matches the original alltoall implementation
 static inline NnUint getSocketIndexForNode(NnUint myNodeIndex, NnUint peerNode) {
     // Root (node 0): sockets map directly to workers
     // socket[0] -> worker 1, socket[1] -> worker 2, etc.
@@ -989,184 +981,81 @@ static inline NnUint getSocketIndexForNode(NnUint myNodeIndex, NnUint peerNode) 
     }
 }
 
-// O(n) Ring All-Gather - Simple and Reliable
-// Each step: all nodes simultaneously send to right and receive from left
 static void ringAllGather(NnNetwork *network, NnUint nodeIndex, NnUint nNodes, NnByte *buffer, NnSize sliceBytes, NnUint nThreads, NnUint threadIndex) {
-    if (threadIndex != 0) return;  // Only thread 0
-    
-    if (threadIndex == 0) {
-        printf("🔄 [Node %u] RING ALL-GATHER START: nNodes=%u, sliceBytes=%zu\n", 
-               nodeIndex, nNodes, sliceBytes);
-        fflush(stdout);
-    }
-    
-    // Ring topology: each node sends to next and receives from previous
+    if (threadIndex != 0) return;
+
     NnUint sendToNode = (nodeIndex + 1) % nNodes;
     NnUint recvFromNode = (nodeIndex + nNodes - 1) % nNodes;
-    
+
     NnUint sendSocketIndex = getSocketIndexForNode(nodeIndex, sendToNode);
     NnUint recvSocketIndex = getSocketIndexForNode(nodeIndex, recvFromNode);
-    
-    printf("🔄 [Node %u] Ring: send to Node %u (socket %u), recv from Node %u (socket %u)\n",
-           nodeIndex, sendToNode, sendSocketIndex, recvFromNode, recvSocketIndex);
-    fflush(stdout);
-    
-    // In n-1 steps, collect all slices
+
     for (NnUint step = 0; step < nNodes - 1; step++) {
-        // Determine which slice to send and where to receive
         NnUint sendSliceIndex = (nodeIndex - step + nNodes) % nNodes;
         NnUint recvSliceIndex = (nodeIndex - step - 1 + nNodes) % nNodes;
-        
-        printf("🔄 [Node %u] Step %u: sending slice %u, receiving slice %u\n",
-               nodeIndex, step, sendSliceIndex, recvSliceIndex);
-        fflush(stdout);
-        
+
         NnSocketIo sendIo, recvIo;
         sendIo.socketIndex = sendSocketIndex;
         sendIo.data = &buffer[sliceBytes * sendSliceIndex];
         sendIo.size = sliceBytes;
-        
+
         recvIo.socketIndex = recvSocketIndex;
         recvIo.data = &buffer[sliceBytes * recvSliceIndex];
         recvIo.size = sliceBytes;
-        
-        // Critical: Send and receive in a way that avoids circular deadlock
-        // Even nodes send first, odd nodes receive first
+
+        // Even nodes send first, odd nodes receive first to avoid deadlock
         if (nodeIndex % 2 == 0) {
-            printf("📤 [Node %u] Step %u: Sending first\n", nodeIndex, step);
-            fflush(stdout);
             network->writeMany(1, &sendIo);
-            printf("📥 [Node %u] Step %u: Now receiving\n", nodeIndex, step);
-            fflush(stdout);
             network->readMany(1, &recvIo);
         } else {
-            printf("📥 [Node %u] Step %u: Receiving first\n", nodeIndex, step);
-            fflush(stdout);
             network->readMany(1, &recvIo);
-            printf("📤 [Node %u] Step %u: Now sending\n", nodeIndex, step);
-            fflush(stdout);
             network->writeMany(1, &sendIo);
         }
-        
-        printf("✅ [Node %u] Step %u complete\n", nodeIndex, step);
-        fflush(stdout);
-    }
-    
-    if (threadIndex == 0) {
-        printf("🔄 [Node %u] RING ALL-GATHER COMPLETE\n", nodeIndex);
-        fflush(stdout);
     }
 }
 
-// Binary Tree Broadcast: O(log n) - Distribute all data from root
-// Uses top-down tree broadcasting with multithreading support  
 static void binaryTreeBroadcast(NnNetwork *network, NnUint nodeIndex, NnUint nNodes, NnByte *buffer, NnSize nBytes, NnUint nThreads, NnUint threadIndex) {
-    if (threadIndex == 0) {
-        printf("📡 [Node %u] BROADCAST START: nNodes=%u, nBytes=%zu, nThreads=%u\n", 
-               nodeIndex, nNodes, nBytes, nThreads);
-        fflush(stdout);
-    }
-    
-    // Calculate tree depth
+    if (threadIndex != 0) return;
+
     NnUint treeDepth = 0;
     NnUint temp = nNodes - 1;
     while (temp > 0) {
         treeDepth++;
         temp >>= 1;
     }
-    
-    if (threadIndex == 0) {
-        printf("📡 [Node %u] Tree depth: %u\n", nodeIndex, treeDepth);
-        fflush(stdout);
-    }
-    
-    // Top-down broadcasting: parents send to children
-    // IMPORTANT: Receivers must be ready BEFORE senders start
+
     for (NnUint level = 0; level < treeDepth; level++) {
-        NnUint step = 1 << level;  // 2^level
-        NnUint stride = step << 1;  // 2^(level+1)
-        
-        if (threadIndex == 0) {
-            printf("📡 [Node %u] Level %u: step=%u, stride=%u, checking role...\n", 
-                   nodeIndex, level, step, stride);
-            fflush(stdout);
-        }
-        
-        // Receivers first
+        NnUint step = 1 << level;
+        NnUint stride = step << 1;
+
         if (nodeIndex % stride == step && nodeIndex < nNodes) {
-            // I'm a receiver at this level
             NnUint parentNode = nodeIndex - step;
-            if (threadIndex == 0) {
-                printf("📥 [Node %u] Level %u: I am RECEIVER from node %u\n", 
-                       nodeIndex, level, parentNode);
-                fflush(stdout);
-            }
-            
-            if (parentNode < nNodes && threadIndex == 0) {
+            if (parentNode < nNodes) {
                 NnUint socketIndex = getSocketIndexForNode(nodeIndex, parentNode);
-                
-                printf("📥 [Node %u] Receiving broadcast from node %u: socketIndex=%u, bytes=%zu\n",
-                       nodeIndex, parentNode, socketIndex, nBytes);
-                fflush(stdout);
-                
                 NnSocketIo io;
                 io.socketIndex = socketIndex;
                 io.data = buffer;
                 io.size = nBytes;
                 network->readMany(1, &io);
-                
-                printf("✅ [Node %u] Broadcast receive complete from node %u\n", nodeIndex, parentNode);
-                fflush(stdout);
             }
         } else if (nodeIndex % stride == 0 && nodeIndex + step < nNodes) {
-            // I'm a sender at this level
             NnUint childNode = nodeIndex + step;
-            if (threadIndex == 0) {
-                printf("📤 [Node %u] Level %u: I am SENDER to node %u\n", 
-                       nodeIndex, level, childNode);
-                fflush(stdout);
-            }
-            
-            if (childNode < nNodes && threadIndex == 0) {
+            if (childNode < nNodes) {
                 NnUint socketIndex = getSocketIndexForNode(nodeIndex, childNode);
-                
-                printf("📤 [Node %u] Broadcasting to node %u: socketIndex=%u, bytes=%zu\n",
-                       nodeIndex, childNode, socketIndex, nBytes);
-                fflush(stdout);
-                
                 NnSocketIo io;
                 io.socketIndex = socketIndex;
                 io.data = buffer;
                 io.size = nBytes;
                 network->writeMany(1, &io);
-                
-                printf("✅ [Node %u] Broadcast complete to node %u\n", nodeIndex, childNode);
-                fflush(stdout);
-            }
-        } else {
-            if (threadIndex == 0) {
-                printf("⏸️  [Node %u] Level %u: I am IDLE (no action at this level)\n", 
-                       nodeIndex, level);
-                fflush(stdout);
             }
         }
     }
-    
-    if (threadIndex == 0) {
-        printf("📡 [Node %u] BROADCAST COMPLETE\n", nodeIndex);
-        fflush(stdout);
-    }
-    // Now all nodes have complete data
 }
 
-// Helper function to check if pointer is properly aligned
 static inline bool isAligned(const void* ptr, size_t alignment) {
     return (reinterpret_cast<uintptr_t>(ptr) % alignment) == 0;
 }
 
-// Helper function to perform element-wise reduction (sum) for All-Reduce
-// Supports F32, F16, Q80, Q40 data types
-// Uses ONLY byte-wise or memcpy-based operations for maximum safety (no direct pointer casting)
 static void reduceSum(NnByte *result, const NnByte *input, NnSize nBytes, NnFloatType floatType) {
     // Safety check: ensure we have valid pointers and non-zero size
     if (!result || !input || nBytes == 0) {
@@ -1245,10 +1134,6 @@ static void reduceSum(NnByte *result, const NnByte *input, NnSize nBytes, NnFloa
     }
 }
 
-// Ring All-Reduce - O(n) with better bandwidth utilization (vLLM/TensorRT style)
-// Phase 1: Reduce-Scatter - Divide data into chunks, ring-pass to reduce
-// Phase 2: All-Gather - Ring-pass reduced chunks to collect full result
-// This provides better scalability than Star topology for large clusters
 static void syncNodeSlices_ringAllReduce(bool onlyFromWorkerToRoot, NnNetwork *network, NnUint nodeIndex, NnUint nNodes, NnByte *buffer, NnSize nBytes, NnFloatType floatType, NnUint nThreads, NnUint threadIndex) {
     if (threadIndex != 0) return;  // Only thread 0 handles ring communication
     
@@ -1341,67 +1226,61 @@ static void syncNodeSlices_ringAllReduce(bool onlyFromWorkerToRoot, NnNetwork *n
     // Now all nodes have the fully reduced result in all chunks
 }
 
-// Star Topology All-Reduce - O(n) Root-Centric with proper multithreading
-// Phase 1: Gather - All workers send their slice to root (root receives in parallel)
-// Phase 2: Reduce - Root performs element-wise sum reduction across all slices
-// Phase 3: Broadcast - Root broadcasts reduced result to all workers
-// This is more efficient than Gather-Broadcast for operations requiring reduction (sum)
 static void syncNodeSlices_starAllReduce(bool onlyFromWorkerToRoot, NnNetwork *network, NnUint nodeIndex, NnUint nNodes, NnByte *buffer, NnSize nBytes, NnFloatType floatType, NnUint nThreads, NnUint threadIndex) {
-    if (threadIndex != 0) return;  // Single-threaded to avoid races on shared buffers
+    if (threadIndex != 0) return;
 
-    // ========== PHASE 1: GATHER TO ROOT (FULL BUFFER) ==========
+    NnUint nWorkers = nNodes - 1;
+
     if (nodeIndex == 0) {
-        // ROOT: Collect full buffers from all workers and reduce into root buffer
-        static thread_local std::vector<NnByte> tempBuffer;
-        if (tempBuffer.size() < nBytes) {
-            tempBuffer.resize(nBytes, 0);
+        // Gather all worker buffers concurrently via readMany
+        static thread_local std::vector<NnByte> gatherBuffer;
+        NnSize totalGatherSize = nBytes * nWorkers;
+        if (gatherBuffer.size() < totalGatherSize) {
+            gatherBuffer.resize(totalGatherSize, 0);
         }
 
-        for (NnUint workerIdx = 1; workerIdx < nNodes; workerIdx++) {
-            NnSocketIo io;
-            io.socketIndex = workerIdx - 1;
-            io.data = tempBuffer.data();
-            io.size = nBytes;
-            network->readMany(1, &io);
-            reduceSum(buffer, tempBuffer.data(), nBytes, floatType);
+        std::vector<NnSocketIo> readIos(nWorkers);
+        for (NnUint w = 0; w < nWorkers; w++) {
+            readIos[w].socketIndex = w;
+            readIos[w].data = &gatherBuffer[w * nBytes];
+            readIos[w].size = nBytes;
         }
-    } else {
-        // WORKER: Send full buffer to root
-        NnSocketIo io;
-        io.socketIndex = 0;
-        io.data = buffer;
-        io.size = nBytes;
-        network->writeMany(1, &io);
-    }
-    
-    // If only gathering to root (for reduction), we're done
-    if (onlyFromWorkerToRoot) {
-        return;
-    }
-    
-    // ========== PHASE 2: BROADCAST FROM ROOT ==========
-    if (nodeIndex == 0) {
-        // ROOT: Broadcast reduced result to all workers
-        for (NnUint workerIdx = 1; workerIdx < nNodes; workerIdx++) {
-            NnSocketIo io;
-            io.socketIndex = workerIdx - 1;
-            io.data = buffer;
-            io.size = nBytes;
-            network->writeMany(1, &io);
+        network->readMany(nWorkers, readIos.data());
+
+        for (NnUint w = 0; w < nWorkers; w++) {
+            reduceSum(buffer, &gatherBuffer[w * nBytes], nBytes, floatType);
         }
+
+        if (onlyFromWorkerToRoot) {
+            return;
+        }
+
+        std::vector<NnSocketIo> writeIos(nWorkers);
+        for (NnUint w = 0; w < nWorkers; w++) {
+            writeIos[w].socketIndex = w;
+            writeIos[w].data = buffer;
+            writeIos[w].size = nBytes;
+        }
+        network->writeMany(nWorkers, writeIos.data());
     } else {
-        // WORKER: Receive reduced result
-        NnSocketIo io;
-        io.socketIndex = 0;
-        io.data = buffer;
-        io.size = nBytes;
-        network->readMany(1, &io);
+        NnSocketIo sendIo;
+        sendIo.socketIndex = 0;
+        sendIo.data = buffer;
+        sendIo.size = nBytes;
+        network->writeMany(1, &sendIo);
+
+        if (onlyFromWorkerToRoot) {
+            return;
+        }
+
+        NnSocketIo recvIo;
+        recvIo.socketIndex = 0;
+        recvIo.data = buffer;
+        recvIo.size = nBytes;
+        network->readMany(1, &recvIo);
     }
 }
 
-// Star Topology Gather-Broadcast - O(n) Root-Centric with proper multithreading
-// Phase 1: All workers send their slice to root (root receives in parallel)
-// Phase 2: Root broadcasts complete buffer to all workers (workers receive)
 static void syncNodeSlices_starGatherBroadcast(bool onlyFromWorkerToRoot, NnNetwork *network, NnUint nodeIndex, NnUint nNodes, NnByte *buffer, NnSize nBytes, NnUint nThreads, NnUint threadIndex) {
     NnSize sliceBytes = nBytes / nNodes;
     
@@ -1474,20 +1353,31 @@ static void syncNodeSlices_starGatherBroadcast(bool onlyFromWorkerToRoot, NnNetw
     // All threads reach here together - synchronized!
 }
 
-// Main syncNodeSlices function
-// Uses All-Reduce (with sum reduction) - optimized with vLLM/TensorRT style algorithms
-static void syncNodeSlices(bool onlyFromWorkerToRoot, NnNetwork *network, NnUint nodeIndex, NnUint nNodes, NnByte *buffer, NnSize nBytes, NnFloatType floatType, NnUint nThreads, NnUint threadIndex) {
+static void syncNodeSlices(bool onlyFromWorkerToRoot, NnNetwork *network, NnUint nodeIndex, NnUint nNodes, NnByte *buffer, NnSize nBytes, NnFloatType floatType, CollectiveType collectiveType, NnUint nThreads, NnUint threadIndex) {
     if (nNodes <= 1 || nBytes == 0) return;
 
-    // Use Star All-Reduce to sum full buffers (root-centric).
-    syncNodeSlices_starAllReduce(onlyFromWorkerToRoot, network, nodeIndex, nNodes, buffer, nBytes, floatType, nThreads, threadIndex);
+    CollectiveType effective = collectiveType;
+    if (effective == COLLECTIVE_AUTO) {
+        effective = COLLECTIVE_STAR;
+    }
+
+    if (onlyFromWorkerToRoot && effective == COLLECTIVE_RING) {
+        effective = COLLECTIVE_STAR;
+    }
+
+    if (effective == COLLECTIVE_RING) {
+        syncNodeSlices_ringAllReduce(onlyFromWorkerToRoot, network, nodeIndex, nNodes, buffer, nBytes, floatType, nThreads, threadIndex);
+    } else {
+        syncNodeSlices_starAllReduce(onlyFromWorkerToRoot, network, nodeIndex, nNodes, buffer, nBytes, floatType, nThreads, threadIndex);
+    }
 }
 
-NnNetworkNodeSynchronizer::NnNetworkNodeSynchronizer(NnNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig) {
+NnNetworkNodeSynchronizer::NnNetworkNodeSynchronizer(NnNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, CollectiveType collectiveType) {
     this->network = network;
     this->execution = execution;
     this->netConfig = netConfig;
     this->nodeConfig = nodeConfig;
+    this->collectiveType = collectiveType;
 }
 
 void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUint threadIndex) {
@@ -1510,10 +1400,10 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
                 syncWithRoot(network, nodeConfig->nodeIndex, pipeBatch, batchBytes, nThreads, threadIndex);
             } else if (syncConfig->syncType == SYNC_NODE_SLICES) {
                 syncTypeName = "SYNC_NODE_SLICES";
-                syncNodeSlices(false, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex);
+                syncNodeSlices(false, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, collectiveType, nThreads, threadIndex);
             } else if (syncConfig->syncType == SYNC_NODE_SLICES_EXCEPT_ROOT) {
                 syncTypeName = "SYNC_NODE_SLICES_EXCEPT_ROOT";
-                syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, nThreads, threadIndex);
+                syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, collectiveType, nThreads, threadIndex);
             } else {
                 throw std::invalid_argument("Unknown sync type");
             }

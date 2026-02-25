@@ -31,6 +31,7 @@ public:
     ChatTemplateType chatTemplateType;
     NnUint maxSeqLen;
     bool netTurbo;
+    CollectiveType collectiveType;
     int gpuIndex;
     int gpuSegmentFrom;
     int gpuSegmentTo;

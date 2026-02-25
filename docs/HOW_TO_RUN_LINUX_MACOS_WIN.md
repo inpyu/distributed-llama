@@ -39,6 +39,12 @@ make dllama
 make dllama-api
 ```
 
+Optional (performance comparison): build a baseline binary from commit `d2c185e1f1335047e6ee3fd5046a09399dd4f515` as `./dllama_0`:
+
+```sh
+make dllama_0
+```
+
 4. Download the model to the **🔸 ROOT** device using the `launch.py` script. You don't need to download the model on worker devices.
 
 ```sh

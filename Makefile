@@ -37,7 +37,7 @@ else
     DELETE_CMD = rm -fv
 endif
 
-.PHONY: clean dllama
+.PHONY: clean dllama dllama_0 dllama_1
 
 clean:
 	$(DELETE_CMD) *.o dllama dllama-* socket-benchmark mmap-buffer-* *-test *.exe
@@ -88,3 +88,13 @@ dllama: src/dllama.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafil
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv, $^) -o $@ $(LIBS)
 dllama-api: src/dllama-api.cpp nn-quants.o nn-core.o nn-executor.o nn-network.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o tokenizer.o llm.o app.o ${DEPS}
 	$(CXX) $(CXXFLAGS) $(filter-out %.spv, $^) -o $@ $(LIBS)
+
+# Baseline build from the pre-refactor commit for performance comparison.
+# Produces ./dllama_0 in the current repo root without modifying the current checkout.
+dllama_0:
+	python3 scripts/build_baseline_dllama.py --out dllama_0
+
+# Build dllama_1 from the requested comparison commit.
+# Produces ./dllama_1 in the current repo root without modifying the current checkout.
+dllama_1:
+	python3 scripts/build_baseline_dllama.py --commit f77754d0adb40f62475cb0c8da9a4e62155377e7 --out dllama_1

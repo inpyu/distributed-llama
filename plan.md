@@ -751,14 +751,14 @@ public:
 
 ## 8. 즉시 실행 우선순위(요약)
 
-**현재 상태**: Phase 1(스레드 병목) 완료
+**현재 상태**: Phase 2(통신 알고리즘 최적화) 완료
 
 **다음 단계 우선순위**:
 
 1) ~~Phase 0: TTFT 분해 측정부터 고정~~ ✅
 2) ~~Phase 1: `NnExecutor::forward()` 스레드 모델을 persistent로 바꿔 thread overhead를 먼저 잡기~~ ✅
-3) **Phase 2**: `SYNC_NODE_SLICES`의 루트 단일 스레드/루트 병목을 제거(또는 ring 옵션 도입)
-4) **Phase 2.5**: Collective 알고리즘 개선 (Ring All-Reduce 기본값 전환, 8노드 안정화)
+3) ~~Phase 2: `SYNC_NODE_SLICES`의 루트 단일 스레드/루트 병목을 제거(또는 ring 옵션 도입)~~ ✅
+4) ~~Phase 2.5: Collective 알고리즘 개선 (Ring All-Reduce 기본값 전환, 8노드 안정화)~~ ✅
 5) **Phase 4**: PP(Pipeline Parallelism) 구현 - TP 그룹 분리 + Stage Boundary 통신
 6) Phase 3: "4노드 그룹 고정 + Replica 라우팅"으로 throughput을 스케일 (PP와 병행 또는 후속)
 

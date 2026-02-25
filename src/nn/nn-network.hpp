@@ -9,6 +9,12 @@
 
 #define ROOT_SOCKET_INDEX 0
 
+enum CollectiveType {
+    COLLECTIVE_AUTO,
+    COLLECTIVE_STAR,
+    COLLECTIVE_RING,
+};
+
 // Network performance monitoring structures
 struct NnNetworkMetrics {
     std::chrono::high_resolution_clock::time_point startTime;
@@ -119,8 +125,9 @@ private:
     NnNetExecution *execution;
     NnNetConfig *netConfig;
     NnNodeConfig *nodeConfig;
+    CollectiveType collectiveType;
 public:
-    NnNetworkNodeSynchronizer(NnNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig);
+    NnNetworkNodeSynchronizer(NnNetwork *network, NnNetExecution *execution, NnNetConfig *netConfig, NnNodeConfig *nodeConfig, CollectiveType collectiveType);
     ~NnNetworkNodeSynchronizer() override {};
     void sync(NnUint segmentIndex, NnUint nThreads, NnUint threadIndex) override;
 };
