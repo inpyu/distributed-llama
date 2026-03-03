@@ -75,6 +75,14 @@ public:
     NnNodeConfig build() {
         NnNodeConfig config;
         config.nodeIndex = nodeIndex;
+        config.ppRank = 0;
+        config.tpRank = nodeIndex;
+        config.tpGroupStart = 0;
+        config.tpGroupEnd = 1;
+        config.positionPipeIndex = 0;
+        config.tokenPipeIndex = 0;
+        config.xPipeIndex = 0;
+        config.logitsPipeIndex = 0;
         config.nBuffers = buffers.size();
         if (config.nBuffers > 0) {
             config.buffers = new NnBufferConfig[config.nBuffers];

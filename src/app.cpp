@@ -2,6 +2,7 @@
 #include <cassert>
 #include <cstring>
 #include <stdexcept>
+#include <algorithm>
 #if defined(DLLAMA_VULKAN)
     #include "nn/nn-vulkan.hpp"
 #endif
@@ -51,6 +52,9 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
     args.maxSeqLen = 0;
     args.netTurbo = true;
     args.collectiveType = COLLECTIVE_AUTO;
+    args.ppSize = 1;
+    args.prefillChunkSize = 0;
+    args.prefillChunkThreshold = 128;
     args.gpuIndex = -1;
     args.gpuSegmentFrom = -1;
     args.gpuSegmentTo = -1;
@@ -131,6 +135,12 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
             args.netTurbo = atoi(value) == 1;
         } else if (std::strcmp(name, "--collective") == 0) {
             args.collectiveType = parseCollectiveType(value);
+        } else if (std::strcmp(name, "--pp-size") == 0) {
+            args.ppSize = (unsigned int)atoi(value);
+        } else if (std::strcmp(name, "--prefill-chunk-size") == 0) {
+            args.prefillChunkSize = (unsigned int)atoi(value);
+        } else if (std::strcmp(name, "--prefill-chunk-threshold") == 0) {
+            args.prefillChunkThreshold = (unsigned int)atoi(value);
         } else {
             throw std::runtime_error("Unknown option: " + std::string(name));
         }
@@ -138,7 +148,39 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
 
     if (args.nThreads < 1)
         throw std::runtime_error("Number of threads must be at least 1");
+    if (args.ppSize < 1)
+        throw std::runtime_error("Pipeline size must be at least 1");
     return args;
+}
+
+NnUint resolvePrefillChunkBatchSize(const AppCliArgs *args, NnUint nPrefillTokens) {
+    if (args->nBatches < 1)
+        return 1;
+
+    if (args->ppSize <= 1)
+        return args->nBatches;
+
+    if (nPrefillTokens < args->prefillChunkThreshold)
+        return args->nBatches;
+
+    if (args->prefillChunkSize > 0)
+        return std::min(args->nBatches, args->prefillChunkSize);
+
+    NnUint autoChunk = args->nBatches / args->ppSize;
+    if (autoChunk < 1)
+        autoChunk = 1;
+
+    if (args->ppSize >= 4)
+        autoChunk = std::max<NnUint>(1, autoChunk / 2);
+
+    NnUint pressureDivisor = args->prefillChunkThreshold > 0 ? args->prefillChunkThreshold : 1;
+    NnUint pressure = nPrefillTokens / pressureDivisor;
+    if (pressure >= 16)
+        autoChunk = std::max<NnUint>(1, autoChunk / 4);
+    else if (pressure >= 8)
+        autoChunk = std::max<NnUint>(1, autoChunk / 2);
+
+    return autoChunk;
 }
 
 AppCliArgs::~AppCliArgs() {
@@ -172,14 +214,19 @@ static std::vector<NnExecutorDevice> resolveDevices(AppCliArgs *args, NnNetConfi
     return devices;
 }
 
-RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExecutor *executor, NnNetwork *network) {
+RootLlmInference::RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExecutor *executor, NnNetwork *network, const NnParallelTopology *topology, NnNodeConfig *nodeConfig) {
     this->header = net->header;
     this->tokenPipe = (float *)execution->pipes[net->tokenPipeIndex];
-    this->positionPipe = (float *)execution->pipes[net->positionPipeIndex];
+    this->positionPipe = (float *)execution->pipes[nodeConfig->positionPipeIndex];
     this->logitsPipe = (float *)execution->pipes[net->logitsPipeIndex];
     this->execution = execution;
     this->executor = executor;
     this->network = network; // May be nullptr!
+    this->nodeConfig = nodeConfig;
+    this->xPipe = execution->pipes[nodeConfig->xPipeIndex];
+    this->xPipeRowBytes = net->netConfig.pipes[nodeConfig->xPipeIndex].size.nBytes / net->netConfig.nBatches;
+    if (network != nullptr && topology->ppSize > 1)
+        this->pipeline.reset(new NnPipelineCommunicator(network, topology, nodeConfig->nodeIndex));
 }
 
 void RootLlmInference::setBatchSize(NnUint batchSize) {
@@ -205,6 +252,20 @@ void RootLlmInference::forward() {
     if (network != nullptr) 
         network->writeAll(&controlPacket, sizeof(LlmControlPacket));
     executor->forward();
+    if (pipeline.get() != nullptr && pipeline->shouldSendActivations()) {
+        const NnSize payloadBytes = xPipeRowBytes * controlPacket.batchSize;
+        if (!pipeline->sendActivation(
+            pipeline->getTargetPpRank(),
+            controlPacket.position,
+            0,
+            nodeConfig->tpRank,
+            xPipe,
+            payloadBytes,
+            F_32
+        )) {
+            throw std::runtime_error("Failed to send pipeline activation from root stage");
+        }
+    }
 }
 
 void RootLlmInference::finish() {
@@ -214,11 +275,16 @@ void RootLlmInference::finish() {
     }
 }
 
-WorkerLlmInference::WorkerLlmInference(NnNetExecution *execution, NnNetwork *network) {
+WorkerLlmInference::WorkerLlmInference(NnNetExecution *execution, NnNetwork *network, const NnParallelTopology *topology, NnNodeConfig *nodeConfig, NnNetConfig *netConfig) {
     this->isFinished = false;
     this->execution = execution;
     this->network = network;
-    this->positionPipe = (float *)execution->pipes[0];
+    this->nodeConfig = nodeConfig;
+    this->positionPipe = (float *)execution->pipes[nodeConfig->positionPipeIndex];
+    this->xPipe = execution->pipes[nodeConfig->xPipeIndex];
+    this->xPipeRowBytes = netConfig->pipes[nodeConfig->xPipeIndex].size.nBytes / netConfig->nBatches;
+    if (topology->ppSize > 1)
+        this->pipeline.reset(new NnPipelineCommunicator(network, topology, nodeConfig->nodeIndex));
 }
 
 bool WorkerLlmInference::tryReadControlPacket() {
@@ -236,8 +302,40 @@ bool WorkerLlmInference::tryReadControlPacket() {
     return true;
 }
 
+void WorkerLlmInference::beforeForward() {
+    if (pipeline.get() == nullptr || !pipeline->shouldRecvActivations())
+        return;
+
+    NnPipelineActivationHeader header;
+    const NnSize bufferSize = xPipeRowBytes * execution->batchSize;
+    if (!pipeline->recvActivation(pipeline->getSourcePpRank(), &header, xPipe, bufferSize))
+        throw NnExecutorException("Failed to receive pipeline activation");
+    if (header.seqPosition != controlPacket.position) {
+        throw NnExecutorException("Pipeline activation position mismatch");
+    }
+}
+
+void WorkerLlmInference::afterForward() {
+    if (pipeline.get() == nullptr || !pipeline->shouldSendActivations())
+        return;
+
+    const NnSize payloadBytes = xPipeRowBytes * execution->batchSize;
+    if (!pipeline->sendActivation(
+        pipeline->getTargetPpRank(),
+        controlPacket.position,
+        0,
+        nodeConfig->tpRank,
+        xPipe,
+        payloadBytes,
+        F_32
+    )) {
+        throw NnExecutorException("Failed to send pipeline activation");
+    }
+}
+
 void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *context)) {
     NnUint nNodes = args->nWorkers + 1;
+    NnParallelTopology topology = createPPxTPTopology(nNodes, args->ppSize);
 
     LlmHeader header = loadLlmHeader(args->modelPath, args->maxSeqLen, args->syncType);
     if (nNodes > header.nKvHeads)
@@ -252,7 +350,7 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
 
     Sampler sampler(tokenizer.vocabSize, args->temperature, args->topp, args->seed);
 
-    LlmNet net = buildLlmNet(&header, nNodes, args->nBatches);
+    LlmNet net = buildLlmNet(&header, topology, args->nBatches);
     std::unique_ptr<LlmNet, void(*)(LlmNet *)> netPtr(&net, releaseLlmNet);
 
     NnNodeConfig *rootNodeConfig = &net.nodeConfigs[0];
@@ -286,7 +384,7 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
     NnRootWeightLoader weightLoader(&executor, network, nNodes);
     loadLlmNetWeight(args->modelPath, &net, &weightLoader);
 
-    RootLlmInference inference(&net, &execution, &executor, network);
+    RootLlmInference inference(&net, &execution, &executor, network, &topology, rootNodeConfig);
 
     if (network != nullptr) {
         network->resetStats();
@@ -299,6 +397,7 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
         if (args->collectiveType == COLLECTIVE_STAR) collectiveName = "star";
         else if (args->collectiveType == COLLECTIVE_RING) collectiveName = "ring";
         printf("📡 Collective: %s (nNodes=%d)\n", collectiveName, nNodes);
+        printf("🔀 Topology: pp=%u tp=%u\n", topology.ppSize, topology.tpSize);
 
         network->enablePerformanceMonitoring(true);
     }
@@ -345,7 +444,10 @@ void runWorkerApp(AppCliArgs *args) {
         NnWorkerWeightReader weightReader(&executor, network);
         weightReader.read();
 
-        WorkerLlmInference inference(&execution, network);
+        const NnUint inferredTpSize = nodeConfig.tpGroupEnd - nodeConfig.tpGroupStart;
+        const NnUint inferredPpSize = inferredTpSize > 0 ? netConfig.nNodes / inferredTpSize : 1;
+        NnParallelTopology topology = createPPxTPTopology(netConfig.nNodes, inferredPpSize);
+        WorkerLlmInference inference(&execution, network, &topology, &nodeConfig, &netConfig);
         bool isFirstAttempt = true;
         bool isTurboEnabled = false;
         clock_t startTime;
@@ -371,7 +473,9 @@ void runWorkerApp(AppCliArgs *args) {
                     isTurboEnabled = true;
                     printf("🚁 Network is in non-blocking mode\n");
                 }
+                inference.beforeForward();
                 executor.forward();
+                inference.afterForward();
                 isFirstAttempt = true;
             } catch (const NnTransferSocketException &e) {
                 printf("🚨 Network error: %s\n", e.what());

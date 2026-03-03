@@ -32,16 +32,31 @@ static void inference(AppInferenceContext *context) {
     NnSize recvBytes = 0;
     NnUint evalTotalTime = 0;
     NnUint predTotalTime = 0;
+    NnUint prefillChunkCount = 0;
+    NnUint prefillChunkTokenTotal = 0;
+    Timer wallClock;
+    NnUint prefillWallUs = 0;
+    NnUint ttftWallUs = 0;
+    bool hasFirstPredToken = false;
 
     int token = inputTokens[pos];
     printf("%s\n", context->args->prompt);
+    const NnUint nPrefillTokens = nInputTokens > 0 ? (NnUint)(nInputTokens - 1) : 0;
+    const NnUint prefillBatchCap = resolvePrefillChunkBatchSize(context->args, nPrefillTokens);
+    if (prefillBatchCap < context->args->nBatches) {
+        printf("🔀 Prefill chunking enabled: chunk=%u (maxBatch=%u, threshold=%u)\n",
+            prefillBatchCap,
+            context->args->nBatches,
+            context->args->prefillChunkThreshold);
+    }
+
     for (;;) {
         long remainingTokens = nInputTokens - 1 - (long)pos;
         if (remainingTokens <= 0)
             break;
-        NnUint batchSize = remainingTokens < context->args->nBatches
+        NnUint batchSize = remainingTokens < prefillBatchCap
             ? remainingTokens
-            : context->args->nBatches;
+            : prefillBatchCap;
 
         context->inference->setBatchSize(batchSize);
         context->inference->setPosition(pos);
@@ -49,9 +64,11 @@ static void inference(AppInferenceContext *context) {
             context->inference->setToken(i, inputTokens[pos + i]);
 
         context->inference->forward();
+        prefillChunkCount++;
+        prefillChunkTokenTotal += batchSize;
 
         pos += batchSize;
-        token = inputTokens[pos + 1];
+        token = inputTokens[pos];
 
         if (context->network != nullptr)
             context->network->getStats(&sentBytes, &recvBytes);
@@ -67,6 +84,8 @@ static void inference(AppInferenceContext *context) {
         evalTotalTime += evalTime + syncTime;
     }
 
+    prefillWallUs = wallClock.elapsedMicroseconds();
+
     fflush(stdout);
 
     context->inference->setBatchSize(1);
@@ -81,6 +100,10 @@ static void inference(AppInferenceContext *context) {
         token = context->sampler->sample(context->inference->logitsPipe);
 
         char *piece = context->tokenizer->decode(token);
+        if (!hasFirstPredToken) {
+            ttftWallUs = wallClock.elapsedMicroseconds();
+            hasFirstPredToken = true;
+        }
 
         if (context->network != nullptr)
             context->network->getStats(&sentBytes, &recvBytes);
@@ -99,11 +122,18 @@ static void inference(AppInferenceContext *context) {
 
     NnUint nEvalTokens = nInputTokens - 1;
     NnUint nPredTokens = pos - nEvalTokens;
+    NnUint totalWallUs = wallClock.elapsedMicroseconds();
+    NnUint decodeWallUs = totalWallUs >= prefillWallUs ? (totalWallUs - prefillWallUs) : 0;
     float evalTotalTimeMs = evalTotalTime / 1000.0;
     float predTotalTimeMs = predTotalTime / 1000.0;
     printf("\n");
     printf("Evaluation\n");
     printf("   nBatches: %d\n", context->args->nBatches);
+    if (prefillChunkCount > 0) {
+        printf(" prefillChunks: %u (avg %3.2f tok/chunk)\n",
+            prefillChunkCount,
+            (float)prefillChunkTokenTotal / (float)prefillChunkCount);
+    }
     printf("    nTokens: %d\n", nEvalTokens);
     printf("   tokens/s: %3.2f (%3.2f ms/tok)\n",
         (nEvalTokens * 1000) / evalTotalTimeMs,
@@ -113,6 +143,11 @@ static void inference(AppInferenceContext *context) {
     printf("   tokens/s: %3.2f (%3.2f ms/tok)\n",
         (nPredTokens * 1000) / predTotalTimeMs,
         predTotalTimeMs / ((float) nPredTokens));
+    printf("Timing\n");
+    printf("  prefillMs: %3.2f\n", prefillWallUs / 1000.0f);
+    printf("     ttftMs: %3.2f\n", (hasFirstPredToken ? ttftWallUs : prefillWallUs) / 1000.0f);
+    printf("   decodeMs: %3.2f\n", decodeWallUs / 1000.0f);
+    printf("    totalMs: %3.2f\n", totalWallUs / 1000.0f);
 }
 
 static NnUint readStdin(const char *guide, char *buffer, NnUint size) {
@@ -203,13 +238,22 @@ static void chat(AppInferenceContext *context) {
         context->tokenizer->encode((char*)inputPrompt.content, inputTokens, &nInputTokens, isStart, true);
 
         NnUint userPromptEndPos = (NnUint)std::min<unsigned int>(seqLen, pos + nInputTokens - 1);
+        NnUint userPrefillTokens = userPromptEndPos > pos ? (userPromptEndPos - pos) : 0;
+        NnUint prefillBatchCap = resolvePrefillChunkBatchSize(context->args, userPrefillTokens);
+        NnUint chatPrefillChunkCount = 0;
+        if (prefillBatchCap < context->args->nBatches) {
+            printf("🔀 Chat prefill chunking enabled: chunk=%u (maxBatch=%u, threshold=%u)\n",
+                prefillBatchCap,
+                context->args->nBatches,
+                context->args->prefillChunkThreshold);
+        }
         for (NnUint i = 0; ;) {
             int remainingTokens = userPromptEndPos - pos;
             if (remainingTokens <= 0)
                 break;
-            NnUint batchSize = remainingTokens < context->args->nBatches
+            NnUint batchSize = remainingTokens < prefillBatchCap
                 ? remainingTokens
-                : context->args->nBatches;
+                : prefillBatchCap;
 
             context->inference->setBatchSize(batchSize);
             context->inference->setPosition(pos);
@@ -217,11 +261,14 @@ static void chat(AppInferenceContext *context) {
                 context->inference->setToken(j, inputTokens[i + j]);
 
             context->inference->forward();
+            chatPrefillChunkCount++;
 
             i += batchSize;
             pos += batchSize;
             token = inputTokens[i + 1];
         }
+        if (chatPrefillChunkCount > 0)
+            printf("🔷️ Chat prefill chunks: %u\n", chatPrefillChunkCount);
 
         context->inference->setBatchSize(1);
         context->tokenizer->resetDecoder();
@@ -257,6 +304,24 @@ static void chat(AppInferenceContext *context) {
     printf("(end of context)\n");
 }
 
+static void printUsage() {
+    printf("Usage:\n");
+    printf("  ./dllama inference --model <path> --tokenizer <path> --prompt <text> --steps <n> [options]\n");
+    printf("  ./dllama chat --model <path> --tokenizer <path> [options]\n");
+    printf("  ./dllama perplexity --model <path> --tokenizer <path> --prompt <text> [options]\n");
+    printf("  ./dllama worker --port <port> [options]\n");
+    printf("\n");
+    printf("Common options:\n");
+    printf("  --nthreads <n>\n");
+    printf("  --buffer-float-type <f32|f16|q40|q80>\n");
+    printf("  --workers <host:port> [host:port ...]\n");
+    printf("  --collective <auto|star|ring>\n");
+    printf("  --pp-size <n>\n");
+    printf("  --prefill-chunk-size <n>\n");
+    printf("  --prefill-chunk-threshold <n>\n");
+    printf("  --help\n");
+}
+
 int main(int argc, char **argv) {
     initQuants();
     initSockets();
@@ -264,6 +329,15 @@ int main(int argc, char **argv) {
     int returnCode = EXIT_SUCCESS;
     try {
         AppCliArgs args = AppCliArgs::parse(argc, argv, true);
+        if (args.help) {
+            printUsage();
+            cleanupSockets();
+            return EXIT_SUCCESS;
+        }
+        if (args.mode == nullptr) {
+            printUsage();
+            throw std::runtime_error("Mode is required");
+        }
         if (std::strcmp(args.mode, "inference") == 0) {
             args.benchmark = true;
             runInferenceApp(&args, &inference);

@@ -2,8 +2,11 @@
 #define APP_HPP
 
 #include <chrono>
+#include <memory>
 #include "nn/nn-core.hpp"
 #include "nn/nn-cpu.hpp"
+#include "nn/nn-pipeline.hpp"
+#include "nn/nn-topology.hpp"
 #include "tokenizer.hpp"
 #include "llm.hpp"
 
@@ -32,6 +35,9 @@ public:
     NnUint maxSeqLen;
     bool netTurbo;
     CollectiveType collectiveType;
+    NnUint ppSize;
+    NnUint prefillChunkSize;
+    NnUint prefillChunkThreshold;
     int gpuIndex;
     int gpuSegmentFrom;
     int gpuSegmentTo;
@@ -58,9 +64,13 @@ private:
     NnNetExecution *execution;
     NnExecutor *executor;
     NnNetwork *network;
+    NnNodeConfig *nodeConfig;
+    std::unique_ptr<NnPipelineCommunicator> pipeline;
+    NnByte *xPipe;
+    NnSize xPipeRowBytes;
     LlmControlPacket controlPacket;
 public:
-    RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExecutor *executor, NnNetwork *network);
+    RootLlmInference(LlmNet *net, NnNetExecution *execution, NnExecutor *executor, NnNetwork *network, const NnParallelTopology *topology, NnNodeConfig *nodeConfig);
     void setBatchSize(NnUint batchSize);
     void setPosition(NnUint position);
     void setToken(NnUint batchIndex, NnUint token);
@@ -75,10 +85,16 @@ private:
     float *positionPipe;
     NnNetExecution *execution;
     NnNetwork *network;
+    NnNodeConfig *nodeConfig;
+    std::unique_ptr<NnPipelineCommunicator> pipeline;
+    NnByte *xPipe;
+    NnSize xPipeRowBytes;
     LlmControlPacket controlPacket;
 public:
-    WorkerLlmInference(NnNetExecution *execution, NnNetwork *network);
+    WorkerLlmInference(NnNetExecution *execution, NnNetwork *network, const NnParallelTopology *topology, NnNodeConfig *nodeConfig, NnNetConfig *netConfig);
     bool tryReadControlPacket();
+    void beforeForward();
+    void afterForward();
 };
 
 typedef struct {
@@ -93,5 +109,6 @@ typedef struct {
 
 void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *context));
 void runWorkerApp(AppCliArgs *args);
+NnUint resolvePrefillChunkBatchSize(const AppCliArgs *args, NnUint nPrefillTokens);
 
 #endif

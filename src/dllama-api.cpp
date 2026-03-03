@@ -410,14 +410,23 @@ public:
 
         NnUint pos = startPos;
         int token;
+        NnUint promptPrefillTokens = promptEndPos > pos ? (promptEndPos - pos) : 0;
+        NnUint prefillBatchCap = resolvePrefillChunkBatchSize(args, promptPrefillTokens);
+        NnUint prefillChunkCount = 0;
+        if (prefillBatchCap < args->nBatches) {
+            printf("🔀 API prefill chunking enabled: chunk=%u (maxBatch=%u, threshold=%u)\n",
+                prefillBatchCap,
+                args->nBatches,
+                args->prefillChunkThreshold);
+        }
         for (NnUint i = 0; ;) {
             long remainingTokens = promptEndPos - pos;
             if (remainingTokens <= 0)
                 break;
 
-            NnUint batchSize = remainingTokens < args->nBatches
+            NnUint batchSize = remainingTokens < prefillBatchCap
                 ? remainingTokens
-                : args->nBatches;
+                : prefillBatchCap;
 
             inference->setBatchSize(batchSize);
             inference->setPosition(pos);
@@ -425,11 +434,14 @@ public:
                 inference->setToken(j, promptTokens[i + j]);
 
             inference->forward();
+            prefillChunkCount++;
 
             i += batchSize;
             pos += batchSize;
             token = promptTokens[i + 1];
         }
+        if (prefillChunkCount > 0)
+            printf("🔷️ API prefill chunks: %u\n", prefillChunkCount);
 
         inference->setBatchSize(1);
         tokenizer->resetDecoder();

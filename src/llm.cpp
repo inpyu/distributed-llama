@@ -2,6 +2,7 @@
 #include "nn/nn-config-builder.hpp"
 #include "nn/nn-cpu.hpp"
 #include "nn/nn-network.hpp"
+#include "nn/nn-pipeline.hpp"
 #include "mmap.hpp"
 #include "llm.hpp"
 #include <cerrno>
@@ -148,7 +149,8 @@ void printLlmHeader(LlmHeader *header) {
     }
 }
 
-LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
+LlmNet buildLlmNet(LlmHeader *h, const NnParallelTopology &topology, NnUint nBatches) {
+    NnUint nNodes = topology.nNodes;
     NnUint nExpertsOr1 = std::max(h->nExperts, 1u);
     NnUint nActiveExpertsOr1 = std::max(h->nActiveExperts, 1u);
     NnUint ffDim = h->hiddenDim;
@@ -201,7 +203,17 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
     n.nodeConfigs = new NnNodeConfig[nNodes];
 
     for (NnUint nodeIndex = 0; nodeIndex < nNodes; nodeIndex++) {
+        NnNodePlacement nodePlacement = topology.getPlacement(nodeIndex);
         NnRopeSlice ropeSlice = sliceRope(h->ropeType, h->qDim, h->kvDim, h->nKvHeads, nNodes, h->seqLen, h->headDim, h->ropeTheta, nodeIndex);
+
+        // Calculate layer range for this PP stage
+        NnUint layersPerStage = h->nLayers / topology.ppSize;
+        NnUint layerStart = nodePlacement.ppRank * layersPerStage;
+        NnUint layerEnd = (nodePlacement.ppRank + 1) * layersPerStage;
+        // For the last stage, include any remaining layers due to division
+        if (nodePlacement.ppRank == topology.ppSize - 1) {
+            layerEnd = h->nLayers;
+        }
         NnNodeConfigBuilder nodeBuilder(nodeIndex);
 
         const NnUint xBufferIndex = nodeBuilder.addBuffer("x", size2D(F_32, nBatches, h->dim));
@@ -245,18 +257,21 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
         const NnUint moeSBufferIndex = nodeBuilder.addBuffer("moe_s", size3D(F_32, nActiveExpertsOr1, nBatches, 1));
 
         NnSegmentConfigBuilder start;
-        if (nodeIndex == 0) {
-            start.addOp(
-                OP_EMBEDDING, "embedding", 0,
-                pointerBatchConfig(SRC_PIPE, n.tokenPipeIndex),
-                pointerBatchConfig(SRC_PIPE, n.xPipeIndex),
-                n.tokenEmbeddingSize,
-                NnEmbeddingOpConfig{});
+        if (nodePlacement.ppRank == 0) {
+            if (nodeIndex == 0) {
+                start.addOp(
+                    OP_EMBEDDING, "embedding", 0,
+                    pointerBatchConfig(SRC_PIPE, n.tokenPipeIndex),
+                    pointerBatchConfig(SRC_PIPE, n.xPipeIndex),
+                    n.tokenEmbeddingSize,
+                    NnEmbeddingOpConfig{});
+            }
+            if (topology.ppSize == 1)
+                start.addSync(n.xPipeIndex, SYNC_WITH_ROOT);
         }
-        start.addSync(n.xPipeIndex, SYNC_WITH_ROOT);
         nodeBuilder.addSegment(start.build());
 
-        for (NnUint layerIndex = 0; layerIndex < h->nLayers; layerIndex++) {
+        for (NnUint layerIndex = layerStart; layerIndex < layerEnd; layerIndex++) {
             const NnUint kBufferIndex = nodeBuilder.addBuffer("k", kvCacheSlice.keySize);
             const NnUint vBufferIndex = nodeBuilder.addBuffer("v", kvCacheSlice.valueSize);
 
@@ -264,7 +279,7 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
             NnSegmentConfigBuilder ff;
 
             // att
-            if (layerIndex == 0) {
+            if (layerIndex == layerStart) {
                 att.addOp(
                     OP_CAST, "block_cast_x", layerIndex,
                     pointerBatchConfig(SRC_PIPE, n.xPipeIndex),
@@ -557,49 +572,78 @@ LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches) {
             nodeBuilder.addSegment(ff.build());
         }
 
-        NnSegmentConfigBuilder end;
-        end.addOp(
-            OP_MERGE_ADD, "final_merge_add", 0,
-            pointerBatchConfig(SRC_PIPE, zqPipeIndex),
-            pointerBatchConfig(SRC_BUFFER, xBufferIndex),
-            size0(),
-            NnMergeAddOpCodeConfig{});
-        end.addOp(
-            OP_INV_RMS, "final_norm_pre", 0,
-            pointerBatchConfig(SRC_BUFFER, xBufferIndex),
-            pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex),
-            size0(),
-            NnInvRmsOpConfig{h->normEpsilon, 1});
-        end.addOp(
-            OP_RMS_NORM, "final_norm", 0,
-            pointerBatchConfig(SRC_BUFFER, xBufferIndex),
-            pointerBatchConfig(SRC_BUFFER, yBufferIndex),
-            n.rmsNormSize,
-            NnRmsNormOpConfig{invRmsBufferIndex, 1});
-        if (yBufferIndex != yqBufferIndex) {
-            end.addOp(
-                OP_CAST, "final_cast_y", 0,
-                pointerBatchConfig(SRC_BUFFER, yBufferIndex),
-                pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
+        if (nodePlacement.ppRank < topology.ppSize - 1) {
+            NnSegmentConfigBuilder bridge;
+            bridge.addOp(
+                OP_MERGE_ADD, "stage_bridge_merge_add", 0,
+                pointerBatchConfig(SRC_PIPE, zqPipeIndex),
+                pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+                size0(),
+                NnMergeAddOpCodeConfig{});
+            bridge.addOp(
+                OP_CAST, "stage_bridge_cast_x", 0,
+                pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+                pointerBatchConfig(SRC_PIPE, n.xPipeIndex),
                 size0(),
                 NnCastOpCodeConfig{});
+            nodeBuilder.addSegment(bridge.build());
         }
-        end.addOp(
-            OP_MATMUL, "final_matmul_logits", 0,
-            pointerBatchedSliceConfig(SRC_BUFFER, yqBufferIndex),
-            pointerBatchConfig(SRC_BUFFER, logitsSliceBufferIndex),
-            size2D(h->weightType, n.wclsSlice.n0, n.wclsSlice.d),
-            NnMatmulOpConfig{});
-        end.addOp(
-            OP_CAST, "final_cast_logits", 0,
-            pointerBatchConfig(SRC_BUFFER, logitsSliceBufferIndex),
-            pointerBatchConfig(SRC_PIPE, n.logitsPipeIndex),
-            size0(),
-            NnCastOpCodeConfig{});
-        end.addSync(n.logitsPipeIndex, SYNC_NODE_SLICES);
 
-        nodeBuilder.addSegment(end.build());
-        n.nodeConfigs[nodeIndex] = nodeBuilder.build();
+        // Final segment: only for the last PP stage
+        if (nodePlacement.ppRank == topology.ppSize - 1) {
+            NnSegmentConfigBuilder end;
+            end.addOp(
+                OP_MERGE_ADD, "final_merge_add", 0,
+                pointerBatchConfig(SRC_PIPE, zqPipeIndex),
+                pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+                size0(),
+                NnMergeAddOpCodeConfig{});
+            end.addOp(
+                OP_INV_RMS, "final_norm_pre", 0,
+                pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, invRmsBufferIndex),
+                size0(),
+                NnInvRmsOpConfig{h->normEpsilon, 1});
+            end.addOp(
+                OP_RMS_NORM, "final_norm", 0,
+                pointerBatchConfig(SRC_BUFFER, xBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, yBufferIndex),
+                n.rmsNormSize,
+                NnRmsNormOpConfig{invRmsBufferIndex, 1});
+            if (yBufferIndex != yqBufferIndex) {
+                end.addOp(
+                    OP_CAST, "final_cast_y", 0,
+                    pointerBatchConfig(SRC_BUFFER, yBufferIndex),
+                    pointerBatchConfig(SRC_BUFFER, yqBufferIndex),
+                    size0(),
+                    NnCastOpCodeConfig{});
+            }
+            end.addOp(
+                OP_MATMUL, "final_matmul_logits", 0,
+                pointerBatchedSliceConfig(SRC_BUFFER, yqBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, logitsSliceBufferIndex),
+                size2D(h->weightType, n.wclsSlice.n0, n.wclsSlice.d),
+                NnMatmulOpConfig{});
+            end.addOp(
+                OP_CAST, "final_cast_logits", 0,
+                pointerBatchConfig(SRC_BUFFER, logitsSliceBufferIndex),
+                pointerBatchConfig(SRC_PIPE, n.logitsPipeIndex),
+                size0(),
+                NnCastOpCodeConfig{});
+            end.addSync(n.logitsPipeIndex, SYNC_NODE_SLICES);
+
+            nodeBuilder.addSegment(end.build());
+        }
+        NnNodeConfig nodeConfig = nodeBuilder.build();
+        nodeConfig.ppRank = nodePlacement.ppRank;
+        nodeConfig.tpRank = nodePlacement.tpRank;
+        nodeConfig.tpGroupStart = nodePlacement.tpGroupStart;
+        nodeConfig.tpGroupEnd = nodePlacement.tpGroupEnd;
+        nodeConfig.positionPipeIndex = n.positionPipeIndex;
+        nodeConfig.tokenPipeIndex = n.tokenPipeIndex;
+        nodeConfig.xPipeIndex = n.xPipeIndex;
+        nodeConfig.logitsPipeIndex = n.logitsPipeIndex;
+        n.nodeConfigs[nodeIndex] = nodeConfig;
     }
     return n;
 }

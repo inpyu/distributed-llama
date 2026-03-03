@@ -20,6 +20,8 @@ typedef SSIZE_T ssize_t;
 #include <iomanip>
 #include <algorithm>
 #include <map>
+#include <set>
+#include <string>
 #include <chrono>
 #include <thread>
 #include <cstdlib>
@@ -259,17 +261,135 @@ static inline int connectSocket(char *host, int port) {
     if (sock < 0)
         throw std::runtime_error("Cannot create socket");
 
+    // Set socket to non-blocking mode for timeout support
+    #ifdef _WIN32
+    u_long mode = 1;
+    ioctlsocket(sock, FIONBIO, &mode);
+    #else
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+    #endif
+
     int connectResult = ::connect(sock, addr->ai_addr, addr->ai_addrlen);
-    if (connectResult != 0) {
+    
+    #ifdef _WIN32
+    if (connectResult == SOCKET_ERROR) {
+        int err = WSAGetLastError();
+        if (err != WSAEWOULDBLOCK) {
+            printf("Cannot connect to %s:%d (error: %d)\n", host, port, err);
+            closesocket(sock);
+            throw NnConnectionSocketException("Cannot connect");
+        }
+    #else
+    if (connectResult < 0 && errno != EINPROGRESS) {
         printf("Cannot connect to %s:%d (%s)\n", host, port, SOCKET_LAST_ERROR);
+        close(sock);
         throw NnConnectionSocketException("Cannot connect");
+    #endif
+    } else {
+        // Connection succeeded immediately (unlikely but possible)
+        #ifdef _WIN32
+        u_long mode = 0;
+        ioctlsocket(sock, FIONBIO, &mode);
+        #else
+        flags = fcntl(sock, F_GETFL, 0);
+        fcntl(sock, F_SETFL, flags & ~O_NONBLOCK);
+        #endif
+        setNoDelay(sock);
+        setQuickAck(sock);
+        freeaddrinfo(addr);
+        return sock;
     }
+
+    // Wait for connection with timeout (30 seconds)
+    fd_set writefds;
+    fd_set exceptfds;
+    struct timeval timeout;
+    timeout.tv_sec = 30;
+    timeout.tv_usec = 0;
+
+    FD_ZERO(&writefds);
+    FD_ZERO(&exceptfds);
+    FD_SET(sock, &writefds);
+    FD_SET(sock, &exceptfds);
+
+    int selectResult = select(sock + 1, NULL, &writefds, &exceptfds, &timeout);
+    
+    if (selectResult == 0) {
+        printf("Connection timeout after 30 seconds connecting to %s:%d\n", host, port);
+        printf("\n");
+        printf("💡 Troubleshooting steps:\n");
+        printf("   1. Verify worker is running: ssh %s 'ps aux | grep dllama'\n", host);
+        printf("   2. Check port is listening: ssh %s 'netstat -tlnp | grep %d'\n", host, port);
+        printf("   3. Test connectivity: ./diagnose_network.sh %s %d\n", host, port);
+        printf("   4. Check firewall rules on both nodes\n");
+        printf("\n");
+        #ifdef _WIN32
+        closesocket(sock);
+        #else
+        close(sock);
+        #endif
+        freeaddrinfo(addr);
+        throw NnConnectionSocketException("Connection timeout");
+    }
+    
+    if (selectResult < 0) {
+        printf("Select error while connecting to %s:%d (%s)\n", host, port, SOCKET_LAST_ERROR);
+        #ifdef _WIN32
+        closesocket(sock);
+        #else
+        close(sock);
+        #endif
+        freeaddrinfo(addr);
+        throw NnConnectionSocketException("Select error");
+    }
+
+    // Check if connection succeeded or failed
+    if (FD_ISSET(sock, &exceptfds)) {
+        printf("Connection failed to %s:%d (exception on socket)\n", host, port);
+        #ifdef _WIN32
+        closesocket(sock);
+        #else
+        close(sock);
+        #endif
+        freeaddrinfo(addr);
+        throw NnConnectionSocketException("Connection failed");
+    }
+
+    // Verify connection status
+    int error = 0;
+    socklen_t len = sizeof(error);
+    #ifdef _WIN32
+    getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&error, &len);
+    #else
+    getsockopt(sock, SOL_SOCKET, SO_ERROR, &error, &len);
+    #endif
+    
+    if (error != 0) {
+        printf("Connection failed to %s:%d (SO_ERROR: %s)\n", host, port, strerror(error));
+        #ifdef _WIN32
+        closesocket(sock);
+        #else
+        close(sock);
+        #endif
+        freeaddrinfo(addr);
+        throw NnConnectionSocketException("Connection failed");
+    }
+
+    // Set socket back to blocking mode
+    #ifdef _WIN32
+    u_long mode = 0;
+    ioctlsocket(sock, FIONBIO, &mode);
+    #else
+    flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags & ~O_NONBLOCK);
+    #endif
 
     setNoDelay(sock);
     setQuickAck(sock);
+    freeaddrinfo(addr);
     return sock;
 }
-
 int createServerSocket(int port) {
     const char *host = "0.0.0.0";
     struct sockaddr_in serverAddr;
@@ -389,6 +509,7 @@ int NnSocket::release() {
 
 std::unique_ptr<NnNetwork> NnNetwork::serve(int port) {
     NnSocket socketSocket(createServerSocket(port));
+    printf("DEBUG: socketSocket.fd = %d\n", socketSocket.fd);
 
     NnUint nSockets;
     NnUint nodeIndex;
@@ -396,21 +517,25 @@ std::unique_ptr<NnNetwork> NnNetwork::serve(int port) {
     NnSocket rootSocket(rootSocketFd);
     printf("⭕ The root node has connected\n");
 
-    readSocket(rootSocketFd, &nSockets, sizeof(nSockets));
-    NnUint nNodes = nSockets - 1; // nSockets - 1 root node
+    NnUint nNodes;
+    readSocket(rootSocketFd, &nNodes, sizeof(nNodes)); // receive total nodes
     printf("⭕ nNodes: %d\n", nNodes);
-    readSocket(rootSocketFd, &nodeIndex, sizeof(nodeIndex));
+    readSocket(rootSocketFd, &nodeIndex, sizeof(nodeIndex)); // receive this worker's node index
     printf("⭕ NodeIndex: %d\n", nodeIndex);
+    nSockets = nNodes - 1;
 
     std::vector<NnSocket> sockets(nSockets);
     sockets[0].assign(rootSocket.release());
 
     printf("⭕ Socket[0]: accepted root node\n");
-    std::vector<std::unique_ptr<char[]>> hosts(nNodes);
-    std::vector<int> ports(nNodes);
+    NnUint nWorkers = nNodes - 1; // exclude root
+    NnUint nOtherWorkers = nWorkers - 1; // exclude this worker
+    printf("⭕ Worker[%d]: expecting %d peer workers\n", nodeIndex, nOtherWorkers);
+    std::vector<std::unique_ptr<char[]>> hosts(nOtherWorkers);
+    std::vector<int> ports(nOtherWorkers);
 
     NnUint hostLen;
-    for (NnUint i = 0; i < nNodes; i++) {
+    for (NnUint i = 0; i < nOtherWorkers; i++) {
         readSocket(rootSocketFd, &hostLen, sizeof(hostLen));
 
         std::unique_ptr<char[]> host(new char[hostLen]);
@@ -420,23 +545,31 @@ std::unique_ptr<NnNetwork> NnNetwork::serve(int port) {
         readSocket(rootSocketFd, &ports[i], sizeof(ports[i]));
     }
 
+    printf("⭕ Worker[%d]: config received, sending initial ACK to root\n", nodeIndex);
     writeAckPacket(rootSocketFd);
 
     // We need to wait here until the root node will send a "root is ready" packet
+    printf("⭕ Worker[%d]: waiting root-ready ACK\n", nodeIndex);
     readAckPacket(rootSocketFd);
+    printf("⭕ Worker[%d]: root-ready ACK received\n", nodeIndex);
 
-    for (NnUint i = 0; i < nNodes; i++) {
+    for (NnUint i = 0; i < nOtherWorkers; i++) {
         char *host = hosts[i].get();
         int port = ports[i];
-        NnUint socketIndex = i + 1;
-        if (i >= nodeIndex) {
-            printf("⭕ Socket[%d]: connecting to %s:%d worker\n", socketIndex, host, port);
-            sockets[socketIndex].assign(connectSocket(host, port));
-            printf("⭕ Socket[%d]: connected\n", socketIndex);
-        } else {
+        // Calculate actual worker's node index from hosts array index
+        NnUint otherWorkerIndex = (i < nodeIndex - 1) ? (i + 1) : (i + 2);
+        NnUint socketIndex = otherWorkerIndex < nodeIndex ? otherWorkerIndex : (otherWorkerIndex - 1);
+        printf("⭕ Worker[%d]: peer node=%d mapped to socketIndex=%d\n", nodeIndex, otherWorkerIndex, socketIndex);
+        if (otherWorkerIndex < nodeIndex) {
+            // Lower-indexed workers are already listening
             printf("⭕ Socket[%d]: wait for %s:%d worker\n", socketIndex, host, port);
             sockets[socketIndex].assign(acceptSocket(socketSocket.fd));
             printf("⭕ Socket[%d]: accepted\n", socketIndex);
+        } else {
+            // Higher-indexed workers: we connect to them
+            printf("⭕ Socket[%d]: connecting to %s:%d worker\n", socketIndex, host, port);
+            sockets[socketIndex].assign(connectSocket(host, port));
+            printf("⭕ Socket[%d]: connected\n", socketIndex);
         }
     }
 
@@ -446,6 +579,19 @@ std::unique_ptr<NnNetwork> NnNetwork::serve(int port) {
 
 std::unique_ptr<NnNetwork> NnNetwork::connect(NnUint nSockets, char **hosts, NnUint *ports) {
     assert(nSockets > 0);
+    NnUint nNodes = nSockets + 1; // +1 for root node
+
+    std::set<std::string> seenEndpoints;
+    for (NnUint i = 0; i < nSockets; i++) {
+        std::string endpoint = std::string(hosts[i]) + ":" + std::to_string(ports[i]);
+        if (!seenEndpoints.insert(endpoint).second) {
+            throw std::runtime_error(
+                "Duplicate worker endpoint detected: " + endpoint +
+                ". Each worker must use a unique host:port (one worker process per endpoint).");
+        }
+    }
+
+    printf("⭕ Root expects %d workers\n", nSockets);
 
     std::vector<NnSocket> sockets(nSockets);
     struct sockaddr_in addr;
@@ -453,8 +599,9 @@ std::unique_ptr<NnNetwork> NnNetwork::connect(NnUint nSockets, char **hosts, NnU
         printf("⭕ Socket[%d]: connecting to %s:%d worker\n", i, hosts[i], ports[i]);
         int fd = connectSocket(hosts[i], ports[i]);
         sockets[i].assign(fd);
-        writeSocket(fd, &nSockets, sizeof(nSockets));
-        writeSocket(fd, &i, sizeof(i)); // send node index
+        writeSocket(fd, &nNodes, sizeof(nNodes)); // send total nodes
+        NnUint nodeIndex = i + 1; // worker node index (root is 0)
+        writeSocket(fd, &nodeIndex, sizeof(nodeIndex)); // send worker's node index
         for (NnUint j = 0; j < nSockets; j++) {
             if (j == i)
                 continue;
@@ -463,9 +610,11 @@ std::unique_ptr<NnNetwork> NnNetwork::connect(NnUint nSockets, char **hosts, NnU
             writeSocket(fd, hosts[j], hostLen);
             writeSocket(fd, &ports[j], sizeof(ports[j]));
         }
+        printf("⭕ Socket[%d]: waiting initial ACK from worker\n", i);
         readAckPacket(fd);
         printf("⭕ Socket[%d]: connected\n", i);
     }
+    printf("⭕ Root: broadcasting root-ready ACK to all workers\n");
     for (NnUint i = 0; i < nSockets; i++) {
         writeAckPacket(sockets[i].fd);
     }
@@ -1134,18 +1283,30 @@ static void reduceSum(NnByte *result, const NnByte *input, NnSize nBytes, NnFloa
     }
 }
 
-static void syncNodeSlices_ringAllReduce(bool onlyFromWorkerToRoot, NnNetwork *network, NnUint nodeIndex, NnUint nNodes, NnByte *buffer, NnSize nBytes, NnFloatType floatType, NnUint nThreads, NnUint threadIndex) {
+static void syncNodeSlices_ringAllReduce(bool onlyFromWorkerToRoot,
+                                         NnNetwork *network,
+                                         NnUint nodeIndex,
+                                         NnUint tpGroupStart,
+                                         NnUint tpGroupEnd,
+                                         NnByte *buffer,
+                                         NnSize nBytes,
+                                         NnFloatType floatType,
+                                         NnUint nThreads,
+                                         NnUint threadIndex) {
     if (threadIndex != 0) return;  // Only thread 0 handles ring communication
-    
+
+    NnUint nNodes = tpGroupEnd - tpGroupStart;
+    if (nNodes <= 1) return;
+    NnUint localNodeIndex = nodeIndex - tpGroupStart;
     NnSize sliceBytes = nBytes / nNodes;
-    
+
     // Ring topology: each node sends to next and receives from previous
-    NnUint sendToNode = (nodeIndex + 1) % nNodes;
-    NnUint recvFromNode = (nodeIndex + nNodes - 1) % nNodes;
-    
+    NnUint sendToNode = tpGroupStart + ((localNodeIndex + 1) % nNodes);
+    NnUint recvFromNode = tpGroupStart + ((localNodeIndex + nNodes - 1) % nNodes);
+
     NnUint sendSocketIndex = getSocketIndexForNode(nodeIndex, sendToNode);
     NnUint recvSocketIndex = getSocketIndexForNode(nodeIndex, recvFromNode);
-    
+
     // ========== PHASE 1: REDUCE-SCATTER ==========
     // Use thread_local vector for safe automatic memory management
     // This avoids stack overflow and manual memory management issues
@@ -1159,9 +1320,9 @@ static void syncNodeSlices_ringAllReduce(bool onlyFromWorkerToRoot, NnNetwork *n
     // In n-1 steps, each node accumulates one chunk through reduction
     for (NnUint step = 0; step < nNodes - 1; step++) {
         // Determine which chunk to send and where to receive
-        NnUint sendChunkIndex = (nodeIndex - step + nNodes) % nNodes;
-        NnUint recvChunkIndex = (nodeIndex - step - 1 + nNodes) % nNodes;
-        
+        NnUint sendChunkIndex = (localNodeIndex - step + nNodes) % nNodes;
+        NnUint recvChunkIndex = (localNodeIndex - step - 1 + nNodes) % nNodes;
+
         NnSocketIo sendIo, recvIo;
         
         // Use pre-allocated buffer
@@ -1176,7 +1337,7 @@ static void syncNodeSlices_ringAllReduce(bool onlyFromWorkerToRoot, NnNetwork *n
         recvIo.size = sliceBytes;
         
         // Even nodes send first, odd nodes receive first (avoid deadlock)
-        if (nodeIndex % 2 == 0) {
+        if (localNodeIndex % 2 == 0) {
             network->writeMany(1, &sendIo);
             network->readMany(1, &recvIo);
         } else {
@@ -1200,9 +1361,9 @@ static void syncNodeSlices_ringAllReduce(bool onlyFromWorkerToRoot, NnNetwork *n
     // ========== PHASE 2: ALL-GATHER ==========
     // In n-1 steps, collect all reduced chunks
     for (NnUint step = 0; step < nNodes - 1; step++) {
-        NnUint sendChunkIndex = (nodeIndex - step + nNodes) % nNodes;
-        NnUint recvChunkIndex = (nodeIndex - step - 1 + nNodes) % nNodes;
-        
+        NnUint sendChunkIndex = (localNodeIndex - step + nNodes) % nNodes;
+        NnUint recvChunkIndex = (localNodeIndex - step - 1 + nNodes) % nNodes;
+
         NnSocketIo sendIo, recvIo;
         
         sendIo.socketIndex = sendSocketIndex;
@@ -1214,7 +1375,7 @@ static void syncNodeSlices_ringAllReduce(bool onlyFromWorkerToRoot, NnNetwork *n
         recvIo.size = sliceBytes;
         
         // Even nodes send first, odd nodes receive first
-        if (nodeIndex % 2 == 0) {
+        if (localNodeIndex % 2 == 0) {
             network->writeMany(1, &sendIo);
             network->readMany(1, &recvIo);
         } else {
@@ -1226,12 +1387,24 @@ static void syncNodeSlices_ringAllReduce(bool onlyFromWorkerToRoot, NnNetwork *n
     // Now all nodes have the fully reduced result in all chunks
 }
 
-static void syncNodeSlices_starAllReduce(bool onlyFromWorkerToRoot, NnNetwork *network, NnUint nodeIndex, NnUint nNodes, NnByte *buffer, NnSize nBytes, NnFloatType floatType, NnUint nThreads, NnUint threadIndex) {
+static void syncNodeSlices_starAllReduce(bool onlyFromWorkerToRoot,
+                                         NnNetwork *network,
+                                         NnUint nodeIndex,
+                                         NnUint tpGroupStart,
+                                         NnUint tpGroupEnd,
+                                         NnByte *buffer,
+                                         NnSize nBytes,
+                                         NnFloatType floatType,
+                                         NnUint nThreads,
+                                         NnUint threadIndex) {
     if (threadIndex != 0) return;
 
+    NnUint nNodes = tpGroupEnd - tpGroupStart;
+    if (nNodes <= 1) return;
+    NnUint rootNode = tpGroupStart;
     NnUint nWorkers = nNodes - 1;
 
-    if (nodeIndex == 0) {
+    if (nodeIndex == rootNode) {
         // Gather all worker buffers concurrently via readMany
         static thread_local std::vector<NnByte> gatherBuffer;
         NnSize totalGatherSize = nBytes * nWorkers;
@@ -1241,7 +1414,8 @@ static void syncNodeSlices_starAllReduce(bool onlyFromWorkerToRoot, NnNetwork *n
 
         std::vector<NnSocketIo> readIos(nWorkers);
         for (NnUint w = 0; w < nWorkers; w++) {
-            readIos[w].socketIndex = w;
+            NnUint workerNode = tpGroupStart + 1 + w;
+            readIos[w].socketIndex = getSocketIndexForNode(nodeIndex, workerNode);
             readIos[w].data = &gatherBuffer[w * nBytes];
             readIos[w].size = nBytes;
         }
@@ -1257,14 +1431,15 @@ static void syncNodeSlices_starAllReduce(bool onlyFromWorkerToRoot, NnNetwork *n
 
         std::vector<NnSocketIo> writeIos(nWorkers);
         for (NnUint w = 0; w < nWorkers; w++) {
-            writeIos[w].socketIndex = w;
+            NnUint workerNode = tpGroupStart + 1 + w;
+            writeIos[w].socketIndex = getSocketIndexForNode(nodeIndex, workerNode);
             writeIos[w].data = buffer;
             writeIos[w].size = nBytes;
         }
         network->writeMany(nWorkers, writeIos.data());
     } else {
         NnSocketIo sendIo;
-        sendIo.socketIndex = 0;
+        sendIo.socketIndex = getSocketIndexForNode(nodeIndex, rootNode);
         sendIo.data = buffer;
         sendIo.size = nBytes;
         network->writeMany(1, &sendIo);
@@ -1274,7 +1449,7 @@ static void syncNodeSlices_starAllReduce(bool onlyFromWorkerToRoot, NnNetwork *n
         }
 
         NnSocketIo recvIo;
-        recvIo.socketIndex = 0;
+        recvIo.socketIndex = getSocketIndexForNode(nodeIndex, rootNode);
         recvIo.data = buffer;
         recvIo.size = nBytes;
         network->readMany(1, &recvIo);
@@ -1353,7 +1528,21 @@ static void syncNodeSlices_starGatherBroadcast(bool onlyFromWorkerToRoot, NnNetw
     // All threads reach here together - synchronized!
 }
 
-static void syncNodeSlices(bool onlyFromWorkerToRoot, NnNetwork *network, NnUint nodeIndex, NnUint nNodes, NnByte *buffer, NnSize nBytes, NnFloatType floatType, CollectiveType collectiveType, NnUint nThreads, NnUint threadIndex) {
+static void syncNodeSlices(bool onlyFromWorkerToRoot,
+                           NnNetwork *network,
+                           NnUint nodeIndex,
+                           NnUint tpGroupStart,
+                           NnUint tpGroupEnd,
+                           NnByte *buffer,
+                           NnSize nBytes,
+                           NnFloatType floatType,
+                           CollectiveType collectiveType,
+                           NnUint nThreads,
+                           NnUint threadIndex) {
+    if (!(tpGroupStart <= nodeIndex && nodeIndex < tpGroupEnd)) {
+        throw std::invalid_argument("node is outside its TP group");
+    }
+    NnUint nNodes = tpGroupEnd - tpGroupStart;
     if (nNodes <= 1 || nBytes == 0) return;
 
     CollectiveType effective = collectiveType;
@@ -1366,9 +1555,9 @@ static void syncNodeSlices(bool onlyFromWorkerToRoot, NnNetwork *network, NnUint
     }
 
     if (effective == COLLECTIVE_RING) {
-        syncNodeSlices_ringAllReduce(onlyFromWorkerToRoot, network, nodeIndex, nNodes, buffer, nBytes, floatType, nThreads, threadIndex);
+        syncNodeSlices_ringAllReduce(onlyFromWorkerToRoot, network, nodeIndex, tpGroupStart, tpGroupEnd, buffer, nBytes, floatType, nThreads, threadIndex);
     } else {
-        syncNodeSlices_starAllReduce(onlyFromWorkerToRoot, network, nodeIndex, nNodes, buffer, nBytes, floatType, nThreads, threadIndex);
+        syncNodeSlices_starAllReduce(onlyFromWorkerToRoot, network, nodeIndex, tpGroupStart, tpGroupEnd, buffer, nBytes, floatType, nThreads, threadIndex);
     }
 }
 
@@ -1400,10 +1589,28 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
                 syncWithRoot(network, nodeConfig->nodeIndex, pipeBatch, batchBytes, nThreads, threadIndex);
             } else if (syncConfig->syncType == SYNC_NODE_SLICES) {
                 syncTypeName = "SYNC_NODE_SLICES";
-                syncNodeSlices(false, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, collectiveType, nThreads, threadIndex);
+                NnUint tpGroupStart = nodeConfig->tpGroupStart;
+                NnUint tpGroupEnd = nodeConfig->tpGroupEnd;
+                if (tpGroupEnd <= tpGroupStart ||
+                    tpGroupEnd > netConfig->nNodes ||
+                    nodeConfig->nodeIndex < tpGroupStart ||
+                    nodeConfig->nodeIndex >= tpGroupEnd) {
+                    tpGroupStart = 0;
+                    tpGroupEnd = netConfig->nNodes;
+                }
+                syncNodeSlices(false, network, nodeConfig->nodeIndex, tpGroupStart, tpGroupEnd, pipeBatch, batchBytes, pipeConfig->size.floatType, collectiveType, nThreads, threadIndex);
             } else if (syncConfig->syncType == SYNC_NODE_SLICES_EXCEPT_ROOT) {
                 syncTypeName = "SYNC_NODE_SLICES_EXCEPT_ROOT";
-                syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, pipeConfig->size.floatType, collectiveType, nThreads, threadIndex);
+                NnUint tpGroupStart = nodeConfig->tpGroupStart;
+                NnUint tpGroupEnd = nodeConfig->tpGroupEnd;
+                if (tpGroupEnd <= tpGroupStart ||
+                    tpGroupEnd > netConfig->nNodes ||
+                    nodeConfig->nodeIndex < tpGroupStart ||
+                    nodeConfig->nodeIndex >= tpGroupEnd) {
+                    tpGroupStart = 0;
+                    tpGroupEnd = netConfig->nNodes;
+                }
+                syncNodeSlices(true, network, nodeConfig->nodeIndex, tpGroupStart, tpGroupEnd, pipeBatch, batchBytes, pipeConfig->size.floatType, collectiveType, nThreads, threadIndex);
             } else {
                 throw std::invalid_argument("Unknown sync type");
             }
@@ -1458,6 +1665,14 @@ void NnRootConfigWriter::writeNet(NnUint socketIndex, NnNetConfig *config) {
 void NnRootConfigWriter::writeNode(NnUint socketIndex, NnNodeConfig *config) {
     network->writeAck(socketIndex);
     network->write(socketIndex, &config->nodeIndex, sizeof(config->nodeIndex));
+    network->write(socketIndex, &config->ppRank, sizeof(config->ppRank));
+    network->write(socketIndex, &config->tpRank, sizeof(config->tpRank));
+    network->write(socketIndex, &config->tpGroupStart, sizeof(config->tpGroupStart));
+    network->write(socketIndex, &config->tpGroupEnd, sizeof(config->tpGroupEnd));
+    network->write(socketIndex, &config->positionPipeIndex, sizeof(config->positionPipeIndex));
+    network->write(socketIndex, &config->tokenPipeIndex, sizeof(config->tokenPipeIndex));
+    network->write(socketIndex, &config->xPipeIndex, sizeof(config->xPipeIndex));
+    network->write(socketIndex, &config->logitsPipeIndex, sizeof(config->logitsPipeIndex));
     network->write(socketIndex, &config->nBuffers, sizeof(config->nBuffers));
     network->write(socketIndex, &config->nSegments, sizeof(config->nSegments));
 
@@ -1532,6 +1747,14 @@ NnNodeConfig NnWorkerConfigReader::readNode() {
 
     NnNodeConfig config;
     network->read(ROOT_SOCKET_INDEX, &config.nodeIndex, sizeof(config.nodeIndex));
+    network->read(ROOT_SOCKET_INDEX, &config.ppRank, sizeof(config.ppRank));
+    network->read(ROOT_SOCKET_INDEX, &config.tpRank, sizeof(config.tpRank));
+    network->read(ROOT_SOCKET_INDEX, &config.tpGroupStart, sizeof(config.tpGroupStart));
+    network->read(ROOT_SOCKET_INDEX, &config.tpGroupEnd, sizeof(config.tpGroupEnd));
+    network->read(ROOT_SOCKET_INDEX, &config.positionPipeIndex, sizeof(config.positionPipeIndex));
+    network->read(ROOT_SOCKET_INDEX, &config.tokenPipeIndex, sizeof(config.tokenPipeIndex));
+    network->read(ROOT_SOCKET_INDEX, &config.xPipeIndex, sizeof(config.xPipeIndex));
+    network->read(ROOT_SOCKET_INDEX, &config.logitsPipeIndex, sizeof(config.logitsPipeIndex));
     network->read(ROOT_SOCKET_INDEX, &config.nBuffers, sizeof(config.nBuffers));
     network->read(ROOT_SOCKET_INDEX, &config.nSegments, sizeof(config.nSegments));
 
@@ -1594,6 +1817,10 @@ NnRootWeightLoader::~NnRootWeightLoader() {
         delete[] temp;
 }
 
+static inline bool isMissingOpByName(const std::invalid_argument &e) {
+    return std::strncmp(e.what(), "Cannot locate op by name:", 24) == 0;
+}
+
 void NnRootWeightLoader::finish() {
     NnUint zeroSize = 0;
     for (NnUint socketIndex = 0; socketIndex < nNodes - 1; socketIndex++) {
@@ -1627,12 +1854,22 @@ void NnRootWeightLoader::writeWeight(NnUint nodeIndex, const char *opName, NnUin
 }
 
 NnSize NnRootWeightLoader::loadRoot(const char *opName, NnUint opIndex, NnSize nBytes, NnByte *weight) {
-    executor->loadWeight(opName, opIndex, 0u, nBytes, weight);
+    try {
+        executor->loadWeight(opName, opIndex, 0u, nBytes, weight);
+    } catch (const std::invalid_argument &e) {
+        if (!isMissingOpByName(e))
+            throw;
+    }
     return nBytes;
 }
 
 NnSize NnRootWeightLoader::loadAll(const char *opName, NnUint opIndex, NnSize nBytes, NnByte *weight) {
-    executor->loadWeight(opName, opIndex, 0u, nBytes, weight);
+    try {
+        executor->loadWeight(opName, opIndex, 0u, nBytes, weight);
+    } catch (const std::invalid_argument &e) {
+        if (!isMissingOpByName(e))
+            throw;
+    }
 
     if (nNodes > 1u) {
         for (NnUint nodeIndex = 1u; nodeIndex < nNodes; nodeIndex++)
@@ -1644,14 +1881,24 @@ NnSize NnRootWeightLoader::loadAll(const char *opName, NnUint opIndex, NnSize nB
 NnSize NnRootWeightLoader::loadRowMatmulSlices(const char *opName, const NnUint opIndex, const NnUint expertIndex, NnRowMatmulSlice *slice, NnByte *weight) {
     const NnUint offset = expertIndex * slice->sliceSize.nBytes;
     if (nNodes == 1u) {
-        executor->loadWeight(opName, opIndex, offset, slice->sliceSize.nBytes, weight);
+        try {
+            executor->loadWeight(opName, opIndex, offset, slice->sliceSize.nBytes, weight);
+        } catch (const std::invalid_argument &e) {
+            if (!isMissingOpByName(e))
+                throw;
+        }
     } else {
         allocate(slice->sliceSize.nBytes);
         for (NnUint nodeIndex = 0; nodeIndex < nNodes; nodeIndex++) {
             splitRowMatmulWeight(slice, nodeIndex, weight, temp);
-            if (nodeIndex == 0u)
-                executor->loadWeight(opName, opIndex, offset, slice->sliceSize.nBytes, temp);
-            else
+            if (nodeIndex == 0u) {
+                try {
+                    executor->loadWeight(opName, opIndex, offset, slice->sliceSize.nBytes, temp);
+                } catch (const std::invalid_argument &e) {
+                    if (!isMissingOpByName(e))
+                        throw;
+                }
+            } else
                 writeWeight(nodeIndex, opName, opIndex, offset, slice->sliceSize.nBytes, temp);
         }
     }
@@ -1661,14 +1908,24 @@ NnSize NnRootWeightLoader::loadRowMatmulSlices(const char *opName, const NnUint 
 NnSize NnRootWeightLoader::loadColMatmulSlices(const char *opName, const NnUint opIndex, const NnUint expertIndex, NnColMatmulSlice *slice, NnByte *weight) {
     const NnUint offset = expertIndex * slice->sliceSize.nBytes;
     if (nNodes == 1) {
-        executor->loadWeight(opName, opIndex, offset, slice->sliceSize.nBytes, weight);
+        try {
+            executor->loadWeight(opName, opIndex, offset, slice->sliceSize.nBytes, weight);
+        } catch (const std::invalid_argument &e) {
+            if (!isMissingOpByName(e))
+                throw;
+        }
     } else {
         allocate(slice->sliceSize.nBytes);
         for (NnUint nodeIndex = 0; nodeIndex < nNodes; nodeIndex++) {
             splitColMatmulWeight(slice, nodeIndex, weight, temp);
-            if (nodeIndex == 0)
-                executor->loadWeight(opName, opIndex, offset, slice->sliceSize.nBytes, temp);
-            else
+            if (nodeIndex == 0) {
+                try {
+                    executor->loadWeight(opName, opIndex, offset, slice->sliceSize.nBytes, temp);
+                } catch (const std::invalid_argument &e) {
+                    if (!isMissingOpByName(e))
+                        throw;
+                }
+            } else
                 writeWeight(nodeIndex, opName, opIndex, offset, slice->sliceSize.nBytes, temp);
         }
     }
@@ -1718,8 +1975,13 @@ void NnWorkerWeightReader::read() {
         network->read(ROOT_SOCKET_INDEX, &nBytes, sizeof(nBytes));
         allocate(nBytes);
         network->read(0, temp, nBytes);
-        executor->loadWeight(opName, opIndex, offset, nBytes, temp);
-        printf("💿 Loaded %22s %3d, %12zu kB\n", opName, opIndex, nBytes / 1024);
+        try {
+            executor->loadWeight(opName, opIndex, offset, nBytes, temp);
+            printf("💿 Loaded %22s %3d, %12zu kB\n", opName, opIndex, nBytes / 1024);
+        } catch (const std::invalid_argument &e) {
+            if (std::strncmp(e.what(), "Cannot locate op by name:", 24) != 0)
+                throw;
+        }
     }
     printf("💿 Weights loaded\n");
 }

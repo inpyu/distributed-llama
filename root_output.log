@@ -1,0 +1,70 @@
+📄 AddBos: 0
+📄 BosId: 128000 (<|begin_of_text|>)
+📄 EosId: 128001 (<|end_of_text|>) 128009 (<|eot_id|>) 
+📄 RegularVocabSize: 128000
+📄 SpecialVocabSize: 256
+💡 Arch: Llama
+💡 HiddenAct: Silu
+💡 Dim: 2048
+💡 HeadDim: 64
+💡 QDim: 2048
+💡 KvDim: 512
+💡 HiddenDim: 8192
+💡 VocabSize: 128256
+💡 nLayers: 16
+💡 nHeads: 32
+💡 nKvHeads: 8
+💡 SeqLen: 8192
+💡 NormEpsilon: 0.000010
+💡 RopeType: Llama
+💡 RopeTheta: 500000
+📀 RequiredMemory: 1673 MB
+⭕ Root expects 1 workers
+⭕ Socket[0]: connecting to localhost:10001 worker
+⭕ Socket[0]: waiting initial ACK from worker
+⭕ Socket[0]: connected
+⭕ Root: broadcasting root-ready ACK to all workers
+⭕ Network is initialized
+🧠 CPU: neon fp16
+💿 Loading weights...
+💿 Weights loaded
+🚁 Network is in non-blocking mode
+📡 Collective: star (nNodes=2)
+🔀 Topology: pp=1 tp=2
+📊 Network performance monitoring enabled
+Hi
+🔶 Pred  160 ms Sync   49 ms | Sent   765 kB Recv   757 kB | #
+🔶 Pred  105 ms Sync   95 ms | Sent   765 kB Recv   757 kB |  (
+🔶 Pred  126 ms Sync   48 ms | Sent   765 kB Recv   757 kB | 195
+🔶 Pred  111 ms Sync   66 ms | Sent   765 kB Recv   757 kB | 9
+🔶 Pred  113 ms Sync   61 ms | Sent   765 kB Recv   757 kB | )
+
+🔶 Pred  142 ms Sync   38 ms | Sent   765 kB Recv   757 kB | *
+🔶 Pred  139 ms Sync   45 ms | Sent   765 kB Recv   757 kB |  In
+🔶 Pred  123 ms Sync   59 ms | Sent   765 kB Recv   757 kB |  the
+
+Evaluation
+   nBatches: 32
+    nTokens: 0
+   tokens/s: nan (nan ms/tok)
+Prediction
+    nTokens: 8
+   tokens/s: 5.37 (186.13 ms/tok)
+
+📊 === Network Performance Report ===
+Socket | Operations | Total MB | Avg Latency | Max Latency | Min Latency | Bandwidth
+-------|------------|----------|-------------|-------------|-------------|----------
+    0  |      1352   |   29.82   |     0.65 ms  |    16.57 ms  |     0.00 ms  |  404.43 Mbps
+
+
+🔍 === Network Bottleneck Analysis ===
+🐌 Slowest Socket: 0 (Avg Latency: 0.65 ms)
+Socket 0: P50=0.00ms, P95=1.15ms, P99=1.17ms
+⚠️  Socket 0 shows high latency variance (P95 >> P50) - potential network congestion
+
+📈 Operation Analysis:
+  SYNC_NODE_SLICES: 391 ops, 6.91 MB, 0.46 ms avg
+  SYNC_WITH_ROOT: 12 ops, 0.09 MB, 0.02 ms avg
+  readMany: 97 ops, 1.72 MB, 1.79 ms avg
+
+⭕ Network is closed

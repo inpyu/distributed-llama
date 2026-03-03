@@ -4,6 +4,7 @@
 #include "nn/nn-core.hpp"
 #include "nn/nn-executor.hpp"
 #include "nn/nn-network.hpp"
+#include "nn/nn-topology.hpp"
 
 enum LlmHeaderKey {
     VERSION = 0,
@@ -97,7 +98,7 @@ typedef struct {
 
 LlmHeader loadLlmHeader(const char* path, const unsigned int maxSeqLen, NnFloatType syncType);
 void printLlmHeader(LlmHeader *header);
-LlmNet buildLlmNet(LlmHeader *h, NnUint nNodes, NnUint nBatches);
+LlmNet buildLlmNet(LlmHeader *h, const NnParallelTopology &topology, NnUint nBatches);
 void releaseLlmNet(LlmNet *net);
 void loadLlmNetWeight(const char* path, LlmNet *net, NnRootWeightLoader *loader);
 

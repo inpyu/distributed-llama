@@ -184,6 +184,14 @@ typedef struct {
 
 typedef struct {
     NnUint nodeIndex;
+    NnUint ppRank;
+    NnUint tpRank;
+    NnUint tpGroupStart;
+    NnUint tpGroupEnd;
+    NnUint positionPipeIndex;
+    NnUint tokenPipeIndex;
+    NnUint xPipeIndex;
+    NnUint logitsPipeIndex;
     NnUint nBuffers;
     NnBufferConfig *buffers;
     NnUint nSegments;
