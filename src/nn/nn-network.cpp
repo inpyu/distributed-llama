@@ -32,8 +32,14 @@ typedef SSIZE_T ssize_t;
 #define ACK 23571114
 #define MAX_CHUNK_SIZE 4096
 
+#if defined(MSG_NOSIGNAL)
+#define NN_SEND_FLAGS MSG_NOSIGNAL
+#else
+#define NN_SEND_FLAGS 0
+#endif
+
 #define DEFAULT_NET_STALL_LOG_MS 2000ul
-#define DEFAULT_NET_STALL_TIMEOUT_MS 8000ul
+#define DEFAULT_NET_STALL_TIMEOUT_MS 60000ul
 
 static unsigned long readTimeoutEnvMs(const char *name, unsigned long fallbackMs) {
     const char *value = std::getenv(name);
@@ -127,7 +133,7 @@ void writeSocket(int socket, const void *data, NnSize size) {
     const unsigned long hardTimeoutMs = getNetStallTimeoutMs();
 
     while (size > 0) {
-        ssize_t s = send(socket, (const char*)data, size, 0);
+        ssize_t s = send(socket, (const char*)data, size, NN_SEND_FLAGS);
         if (s < 0) {
             if (isEagainError()) {
                 auto now = std::chrono::steady_clock::now();
@@ -726,7 +732,7 @@ void NnNetwork::writeMany(NnUint n, NnSocketIo *ios) {
                 pendingBytes += io->size;
                 int socket = sockets[io->socketIndex];
                 ssize_t chunkSize = io->size > MAX_CHUNK_SIZE ? MAX_CHUNK_SIZE : io->size;
-                ssize_t s = send(socket, (const char*)io->data, chunkSize, 0);
+                ssize_t s = send(socket, (const char*)io->data, chunkSize, NN_SEND_FLAGS);
                 if (s < 0) {
                     if (isEagainError()) {
                         continue;
@@ -1547,7 +1553,11 @@ static void syncNodeSlices(bool onlyFromWorkerToRoot,
 
     CollectiveType effective = collectiveType;
     if (effective == COLLECTIVE_AUTO) {
-        effective = COLLECTIVE_STAR;
+        if (!onlyFromWorkerToRoot && nNodes >= 4) {
+            effective = COLLECTIVE_RING;
+        } else {
+            effective = COLLECTIVE_STAR;
+        }
     }
 
     if (onlyFromWorkerToRoot && effective == COLLECTIVE_RING) {

@@ -7,7 +7,7 @@
 static inline void executeStep(NnExecutorStep *step, NnUint nThreads, NnExecutorThread *thread, NnExecutorContext *context);
 
 #define DEFAULT_EXEC_STALL_LOG_MS 2000ul
-#define DEFAULT_EXEC_STALL_TIMEOUT_MS 10000ul
+#define DEFAULT_EXEC_STALL_TIMEOUT_MS 180000ul
 
 static unsigned long readExecutorTimeoutEnvMs(const char *name, unsigned long fallbackMs) {
     const char *value = std::getenv(name);
